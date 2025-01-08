@@ -1,0 +1,128 @@
+---
+title: "Heatmap"
+output:
+  
+  pdf_document:
+    keep_md: true
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: kable
+  html_document:
+    pdf_document:
+    keep_md: true
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+always_allow_html: true
+header-includes:
+  - \hypersetup{colorlinks=true, linkcolor=blue}
+---
+
+```{r}
+# if libraries are not installed,
+# use install.packages() to install them
+# for example, install.packages("tidyverse")
+# Then run library(tidyverse)
+library(tidyverse)
+library(ggplot2)
+library(viridis)
+
+# to install ComplexHeatmap,
+# Step 1. install.packages("BiocManager")
+# Step 2. BiocManager::install("ComplexHeatmap")
+# Step 3. library(ComplexHeatmap)
+library(ComplexHeatmap)
+
+```
+
+```{r}
+# Input
+
+# Gene list to go on heatmap
+
+# significant_genelist_CC_vs_HKCC <- c("IL1B", "CCL4", "IL10", "CXCL5", "IL6")
+# significant_genelist_CL075_vs_ctrl <- c("IL12", "IL27", "IL10", "CXCL5", "IL6")
+# 
+# sig_genelist_union <- union(significant_genelist_CC_vs_HKCC, significant_genelist_CL075_vs_ctrl)
+
+# genelist <- c("IL13", "IL4", "IL32", "IL24", "IL16", "IL15", "IL27", "IL12A", "IL20", "IL36B", "IL36RN", "IL23A", "IL36C", "IL7", "IL1A", "IL1B", "IL6", "IL1RN", "IL18", "IL12B", "IL10", "IL19")
+
+# genelist <- c("CCL24", "CXCL14", "CXCL1", "CXCL5", "CCL23", "CCL5", "CCL4L2", "CCL3L1", "CCL3", "CCL4", "CCL20", "CXCL8", "CXCL3", "CXCL2", "CCL15", "CCL1", "CCL18", "CXCL6", "CCL7", "CCL2", "CCL13", "CXCL16", "CCL8", "CXCL11", "CXCL10", "CXCL9", "XCL1", "CCL22", "XCL2")
+
+# genelist <- c("TLR5", "TLR10", "TLR4", "TLR2", "TLR8", "TLR7", "TLR6", "TLR1")
+
+#genelist <- c("NLRP2", "NLRP3", "NLRP7", "NLRC3", "NLRC5", "NOD1", "NOD2", "NAIP", "CITA", "NLRP12", "NLRC4", "NLRX1", "NLRP1")
+
+# genelist <- c("IRF4", "IRF1", "IRF8", "IRF2", "IRF7", "IRF9", "IRF5", "IRF3")
+
+genelist <- c("IL12RB2", "IL2RB", "IL17RB", "IL18R1", "IL18RAP", "IL1RL1", "IL2RG", "IL4R", "IL6R", "IL6ST", "IL7R", "IL15RA", "IL2RA", "IL1R1", "IL17RC", "IL31RA", "IL1RAP", "IL20RB", "IL21R", "IL10RB", "IL1R2", "IL13RA1", "CXCR2", "IL12RB1", "IL17RA", "IL5RA", "IL1RL2", "IL27RA", "IL10RA")
+```
+
+```{r}
+# read in expression data
+filename <- "scaled_expression_all_samples.csv" # filename relative to directory where this script is
+expr_data <- read.csv2(file = paste0("tables/", filename))
+
+colnames(expr_data)[1] <- "Gene"
+
+# extract gene expression
+heatmap_table <- expr_data %>% 
+  filter(Gene %in% genelist) %>% 
+  column_to_rownames("Gene") %>% 
+  dplyr::select(paste0("ctrl.", 1:4), 
+                paste0("CL075.", 1:4), 
+                paste0("HKCC.", 1:4), 
+                paste0("CC.", 1:4))
+
+# insert NAs
+# for(i in 1:nrow(heatmap_table))
+# {
+#   gene <- rownames(heatmap_table)[i]
+#   
+#   if(gene %in% significant_genelist_CC_vs_HKCC)
+#     if(gene %in% significant_genelist_CL075_vs_ctrl)
+#       heatmap_table[gene,] <- heatmap_table[gene,]
+#     else
+#       heatmap_table[gene,c(paste0("CL075-", 1:4), paste0("ctrl-", 1:4))] <- NA
+#   else
+#     heatmap_table[gene,c(paste0("HKCC-", 1:4), paste0("CC-", 1:4))] <- NA
+# }
+
+
+#View(heatmap_table)
+
+h <- Heatmap(heatmap_table, name = "z-score", 
+        col = viridis_pal(option = "A")(8), # control colour on heatmap
+        #col = colorRamp2(c(5, 0, -5), c("blue", "white", "red")),
+        width = ncol(heatmap_table)*unit(3, "mm"), # width of each cell in heatmap
+        height = nrow(heatmap_table)*unit(2.5, "mm"), # height of cells in heatmap
+        na_col = "grey",
+        cluster_rows= T, # cluster rows or not - T or F
+        cluster_columns = F, 
+        column_split = c(rep("ctrl", 4), rep("CL075", 4), rep("HKCC", 4), rep("CC", 4)),
+        show_column_dend = F, # show dendrogram or not - T or F
+        show_row_dend = F, 
+        show_row_names = T, # remove if there are too many genes
+        row_names_gp = gpar(fontsize = 6), # fontsize of gene names
+        show_column_names = T,
+        column_names_side = "top", 
+        column_names_rot = 45, # rot = rotation
+        column_names_gp = gpar(fontsize = 8), # fontsize of column (sample) names
+        #column_km = 4, # how many clusters the columns shall be divided into
+        border = TRUE, 
+        border_gp = gpar(col = "darkgrey"))
+
+draw(h)
+```
+
+```{r}
+# save heatmap as pdf
+heatmap_filename <- "heatmap_IL_receptors"
+
+pdf(paste0(heatmap_filename, ".pdf"))
+draw(h)
+dev.off()
+
+```

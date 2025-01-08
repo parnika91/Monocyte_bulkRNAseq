@@ -1,0 +1,1819 @@
+---
+title: "Alt. activation of NLRP3 inflammosome - Bulk RNA-seq data analysis"
+output:
+  
+  pdf_document:
+    keep_md: true
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: kable
+  html_document:
+    pdf_document:
+    keep_md: true
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+always_allow_html: true
+header-includes:
+  - \hypersetup{colorlinks=true, linkcolor=blue}
+---
+
+```{r setup, include=FALSE}
+httr::set_config(httr::config(ssl_verifypeer = FALSE))
+knitr::opts_chunk$set(warning = F, message = F)
+knitr::opts_chunk$set(dpi=300,fig.width=7)
+
+```
+
+# Packages
+
+```{r packages, warning=FALSE, message=FALSE, echo = F}
+# BiocManager::install("edgeR")
+# BiocManager::install("GO.db")
+# BiocManager::install("org.Hs.eg.db")
+# install.packages("remotes")
+# remotes::install_github("jmw86069/multienrichjam",dependencies=TRUE);
+# BiocManager::install("pathview")
+# library(edgeR)
+# library(tidyverse)
+# library(ggplot2)
+# library(ggrepel)
+# library(GO.db)
+# library(org.Hs.eg.db)
+# library(biomaRt)
+# library(pheatmap)
+# library(RColorBrewer)
+# library(ComplexHeatmap)
+# library(wesanderson)
+# library(topGO)
+# library(EnsDb.Hsapiens.v79)
+# library(statmod)
+# library(patchwork)
+# library(multienrichjam)
+# library(enrichplot)
+# library(DOSE)
+# library(clusterProfiler)
+# library(GOSemSim)
+# library(ggupset)
+#library(pathview)
+list.of.packages <- c("ggplot2", "edgeR", "tidyverse", "ggrepel", "pheatmap", "RColorBrewer", "ggnewscale", "wesanderson", "statmod", "patchwork", "ggupset", "viridis", "igraph", "ggraph", "scales", "httr", "jsonlite")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+
+Bioc.packages <- c("GO.db", "org.Hs.eg.db", "biomaRt", "ComplexHeatmap", "topGO", "EnsDb.Hsapiens.v79", "enrichplot",
+                   "GOSemSim", "clusterProfiler", "ggtree")
+new.bpackages <- Bioc.packages[!(Bioc.packages %in% installed.packages()[,"Package"])]
+if(length(new.bpackages)) BiocManager::install(new.bpackages)
+invisible(lapply(c(list.of.packages, Bioc.packages), library, character.only = TRUE))
+
+
+if(!require(multienrichjam)){
+  install.packages("remotes")
+    remotes::install_github("jmw86069/multienrichjam",dependencies=TRUE)
+    library(multienrichjam)
+}
+
+```
+
+# Load data
+
+```{r load_data, echo = F}
+data <- read.csv("../Results/gene_counts/P1255_genecounts.csv", row.names=1, sep=";")
+
+# clean the column names
+colnames(data) <- sapply(colnames(data), function(x) strsplit(x, split= "Aligned")[[1]][1])
+colnames(data) <- gsub("\\.", "_", colnames(data))
+colnames(data) <- gsub("X", "", colnames(data))
+```
+
+# Processing of data
+
+Includes filtering genes by expression, extracting protein-coding genes, getting gene symbols, normalisation, estimating dispersion and testing for diff expressed genes
+
+```{r DGEList, echo = F}
+# assign groups to each column
+group = substr(colnames(data), 4, nchar(colnames(data)))
+# create DGEList
+y <- DGEList(counts = data, group = group)
+#remove .x from geneID
+rownames(y) <- sapply(rownames(y), 
+                                 function(x) strsplit(x, split = "\\.")[[1]][1])
+
+# filter genes without "worthwhile" counts in minimum two samples
+keep <- filterByExpr(y)
+
+# keep only protein coding genes
+ensembl <- useEnsembl("ensembl",dataset="hsapiens_gene_ensembl") #,host="https://uswest.ensembl.org"
+my.genes <- rownames(y)
+out <- getBM(attributes=c("ensembl_gene_id", "gene_biotype"), 
+    filters="ensembl_gene_id", values=my.genes, mart=ensembl)
+out <- out[match(my.genes, out$ensembl_gene_id),]
+
+
+keep <- keep & (out$gene_biotype=="protein_coding" & !is.na(out$gene_biotype))
+
+y <- y[keep, , keep.lib.sizes=FALSE]
+# #genes went down from 61857 to 12309!!
+
+# get gene smybols
+#VERY IMPORTANT: y$genes should be a data frame, otherwise glmQLFTest or glmTreat doesn't work
+y$genes <- data.frame(Symbol = mapIds(org.Hs.eg.db, rownames(y), keytype="ENSEMBL", column="SYMBOL"))
+
+
+### analysis after removing everything except protein coding genes
+
+# Normalisation
+#edgeR is concerned with differential expression analysis rather than 
+#with the quantification of expression levels
+
+#For example, read counts can generally be expected to be proportional to length as well as to
+#expression for any transcript, but edgeR does not generally need to adjust for gene length
+#because gene length has the same relative influence on the read counts for each RNA sample.
+#For this reason, normalization issues arise only to the extent that technical factors have
+#sample-specific effects.
+
+# calculate normalisation factors based on lib size
+y <- calcNormFactors(y)
+
+# design matrix
+design <- model.matrix(~0+group)
+# ~group: (Intercept)CC(1) groupCL075(2) groupctrl(3) groupHKCC(4)
+# ~0+group: removes the intercept: groupCC groupCL075 groupctrl groupHKCC
+
+# estimate common dispersion and tagwise dispersions in one run (recommended):
+y <- estimateDisp(y, design, robust=T)
+
+# testing for DE genes
+fit <- glmQLFit(y, design, robust = T)
+```
+
+### MDS of samples based on genes which separate the samples the most
+
+```{r}
+
+# MDS
+pch <- c(0,1,2,15)
+colors <- rep(c("darkgreen", "red", "blue", "black"), 1)
+#svg("MDS.svg")
+plotMDS(y, col=colors[factor(group)], pch=pch[factor(group)], main = "MDS")
+legend("topright", legend=levels(factor(group)), pch=pch, col=colors, ncol=2)
+#dev.off()
+
+# MD plots
+# An MD plot visualizes the library size-adjusted log-fold change between two libraries (the difference) against the average log-expression across those libraries (the mean). The following command produces an MD plot that compares sample 1 to an artificial reference library constructed from the average of all the other samples
+# for(i in 1:length(group))
+# {
+#   plotMD(y, column=i)
+#   abline(h=0, col="red", lty=2, lwd=2)
+# }
+
+```
+
+### CC vs HKCC (base) DE genes 
+
+```{r}
+# to compare HKCC-CC:
+HKCC_CC_con <- makeContrasts(groupCC - groupHKCC, levels = design)
+tr.HKCCvsCC <- glmTreat(fit, contrast=HKCC_CC_con)
+is.de.HKCCvsCC <- decideTestsDGE(tr.HKCCvsCC, p.value = 0.05, lfc = 2)
+
+summary(is.de.HKCCvsCC)
+#png("MD_CCvHKCC_pval0.05_lfc2.png")
+plotMD(tr.HKCCvsCC, 
+       status=is.de.HKCCvsCC, 
+       legend="topright")
+#dev.off()
+
+```
+
+### Heatmap of all genes (z-score of expression)
+
+```{r}
+logCPM <- cpm(y, prior.count=2, log=TRUE)
+rownames(logCPM) <- y$genes$Symbol
+colnames(logCPM) <- paste(y$samples$group, c(rep(1, 4), rep(2, 4), rep(3, 4), rep(4, 4)), sep="-")
+
+z <- t(scale(t(logCPM))) 
+
+# complex heatmap
+# Donor = c("D1" = "coral", "D2" = "darkolivegreen3", "D3" = "deepskyblue", "D4" = "gold"
+column_ha = HeatmapAnnotation(Donor = c(rep("D1", 4), rep("D2", 4), rep("D3", 4), rep("D4", 4)),
+                              Condition = rep(c("CC", "CL075", "ctrl", "HKCC"), 4),
+                              col = list(Donor = c("D1" = "#30123BFF", "D2" = "#1AE4B6FF", "D3" = "#FABA39FF", "D4" = "#7A0403FF"),
+                                         Condition = c("CC" = "#440154FF", "CL075" = "#2D708EFF", "ctrl" = "#2BB07FFF", "HKCC" = "#C2DF23FF")),
+                              simple_anno_size = unit(0.3, "cm"),
+                              annotation_name_gp= gpar(fontsize = 9))
+h <- Heatmap(z, name = "z-score", 
+        col = viridis_pal(option = "A")(8),
+        width = ncol(z)*unit(3, "mm"),
+        #height = nrow(z)*unit(0.3, "mm"),
+        cluster_rows= T, cluster_columns = T, 
+        show_column_dend = T, show_row_dend = F, 
+        show_row_names = F, show_column_names = F,
+        # column_names_side = "top", column_names_rot = 45, 
+        # column_names_gp = gpar(fontsize = 8),
+        column_title = NULL, 
+        row_title = NULL,
+        border = TRUE, border_gp = gpar(col = "darkgrey"),
+        top_annotation = column_ha)
+
+svg("allgenes_heatmap_modified_Apr2023.svg")
+draw(h)
+dev.off()
+```
+
+### CC vs HKCC (base) volcano and heatmap
+
+```{r}
+# volcano function
+my_volcano <- function(dgelrt, title)
+{
+  x <-dgelrt$table
+  annot <- biomaRt::select(org.Hs.eg.db,
+    keys = row.names(x),
+    columns = c('ENTREZID','SYMBOL','ENSEMBL', 'GENENAME'),
+    keytype = 'ENSEMBL')
+
+  df <- x %>% 
+    mutate(FDR = p.adjust(PValue, method = "BH")) %>% 
+    tibble::rownames_to_column("ENSEMBL") %>% 
+    left_join(., annot) %>% 
+    mutate(geneID = case_when(
+      is.na(SYMBOL) ~ ENSEMBL,
+      TRUE ~ SYMBOL))
+    
+
+  df %>% 
+    mutate(logPval = -log10(PValue)) %>% 
+    mutate(logFDR = -log10(FDR)) %>% 
+    mutate(col = case_when(
+      logFDR >= 2 & abs(logFC) >= 2 ~ "deepskyblue4",
+      logFDR < 2 & abs(logFC) >= 2 ~ "firebrick",
+      logFDR >= 2 & abs(logFC) < 2 ~ "darkolivegreen",
+      TRUE ~ "gray"
+    )) %>% 
+    mutate(label = case_when(
+      logFDR >= 2 & abs(logFC) >= 2.5 ~ geneID,
+      TRUE ~ ""
+    )) %>% 
+    distinct(ENSEMBL, .keep_all = T) -> df
+  
+  ggplot(df, aes(x = logFC, y = logFDR, colour = col, label = label)) +
+    geom_point(alpha = 0.4) +
+    scale_colour_identity() +
+    scale_shape_identity() +
+    theme_bw() +
+    scale_x_continuous("log2 fold change", breaks = seq(-10,10,2)) +
+    geom_hline(yintercept = 2, linetype = "dashed", colour = "gray84") +
+    geom_vline(xintercept = 2, linetype = "dashed", colour = "gray84") +
+    geom_vline(xintercept = -2, linetype = "dashed", colour = "gray84") +
+    #geom_text(hjust=0, vjust=0, size = 2) +
+    geom_text_repel(size = 2.2) +
+    xlab("log2 fold change") +
+    ylab("-log10 FDR") +
+    ggtitle(title)
+}
+
+logCPM <- cpm(y, prior.count=2, log=TRUE)
+rownames(logCPM) <- y$genes$Symbol
+colnames(logCPM) <- paste(y$samples$group, c(rep(1, 4), rep(2, 4), rep(3, 4), rep(4, 4)), sep="-")
+
+z <- t(scale(t(logCPM))) 
+
+pval_table <- tr.HKCCvsCC$table %>% 
+  tibble::rownames_to_column("ENSEMBL") %>% 
+  mutate(FDR = p.adjust(PValue, method = "BH")) %>% 
+  filter(FDR < 0.05 & abs(logFC) >= 2)
+
+HKCC_cc_genes <- tr.HKCCvsCC$genes %>% 
+  tibble::rownames_to_column("ENSEMBL") %>% 
+  left_join(pval_table, .) %>% 
+  select(Symbol, FDR, logFC) %>% 
+  arrange(FDR)
+
+HKCC_cc_logCPM <- z %>% 
+  as.data.frame() %>% 
+  tibble::rownames_to_column("Symbol") %>% 
+  dplyr::select(Symbol, contains("CC")) %>% 
+  filter(Symbol %in% c(HKCC_cc_genes$Symbol[1:61], "ZNF223", "PLEKHH3")) %>% 
+  left_join(HKCC_cc_genes) %>% 
+  tibble::column_to_rownames("Symbol") %>% 
+  arrange(-logFC)
+
+
+
+
+row_ha = rowAnnotation(#Gene = row_anno$Symbol,
+                           #FDR = anno_barplot(-log10(HKCC_cc_logCPM_pval$FDR)),
+                           log2FC = anno_barplot(HKCC_cc_logCPM$logFC, gp = gpar(fill = ifelse(HKCC_cc_logCPM$logFC > 0, "navyblue", "darkred"), col = "white"), border = F),
+                              # col = list(Donor = c("D1" = "#30123BFF", "D2" = "#1AE4B6FF", "D3" = "#FABA39FF", "D4" = "#7A0403FF"),
+                              #            Condition = c("CC" = "#440154FF", "CL075" = "#2D708EFF", "ctrl" = "#2BB07FFF", "HKCC" = "#C2DF23FF")),
+                              simple_anno_size = unit(0.3, "cm"),
+                              annotation_name_gp= gpar(fontsize = 9))
+
+HKCC_cc_heatmap <- Heatmap(HKCC_cc_logCPM[,1:8], name = "z-score", 
+        width = 8*unit(5, "mm"), 
+        height = 60*unit(1.5, "mm"),
+        col =viridis_pal(option = "A")(8), 
+        cluster_rows= F, cluster_columns = T, 
+        show_column_dend = F, show_row_dend = F, 
+        show_row_names = T, row_names_gp = gpar(fontsize = 4),
+        column_names_side = "top", column_names_rot = 45, 
+        column_names_gp = gpar(fontsize = 6),
+        #row_km = 2, 
+        column_km = 2, 
+        border = TRUE, 
+        column_title = NULL, row_title = NULL, 
+        border_gp = gpar(col = "darkgrey"),
+        right_annotation = row_ha)
+#dev.off()
+# draw(HKCC_cc_heatmap)
+pdf("HKCC_CC_heatmap_modified_20June2023.pdf")
+draw(HKCC_cc_heatmap)
+dev.off()
+# 
+# pdf("CC_HKCC_volcano.pdf")
+# my_volcano(tr.HKCCvsCC, "HKCC vs CC")
+# dev.off()
+
+```
+
+```{r}
+logCPM <- cpm(y, prior.count=2, log=TRUE)
+rownames(logCPM) <- y$genes$Symbol
+colnames(logCPM) <- paste(y$samples$group, c(rep(1, 4), rep(2, 4), rep(3, 4), rep(4, 4)), sep="-")
+
+z <- t(scale(t(logCPM))) 
+
+pval_table <- tr.CL075vsctrl$table %>% 
+  tibble::rownames_to_column("ENSEMBL") %>% 
+  mutate(FDR = p.adjust(PValue, method = "BH")) %>% 
+  filter(FDR < 0.05 & abs(logFC) >= 2)
+
+CL075_ctrl_genes <- tr.CL075vsctrl$genes %>% 
+  tibble::rownames_to_column("ENSEMBL") %>% 
+  left_join(pval_table, .) %>% 
+  select(Symbol, FDR, logFC) %>% 
+  arrange(FDR)
+
+CL075_ctrl_logCPM <- z %>% 
+  as.data.frame() %>% 
+  tibble::rownames_to_column("Symbol") %>% 
+  dplyr::select(Symbol, contains("ctrl"), contains("CL075")) %>% 
+  filter(Symbol %in% c(CL075_ctrl_genes$Symbol[1:60])) %>% 
+  left_join(CL075_ctrl_genes) %>% 
+  tibble::column_to_rownames("Symbol") %>% 
+  arrange(-logFC)
+
+
+
+
+row_ha = rowAnnotation(#Gene = row_anno$Symbol,
+                           #FDR = anno_barplot(-log10(HKCC_cc_logCPM_pval$FDR)),
+                           log2FC = anno_barplot(CL075_ctrl_logCPM$logFC, gp = gpar(fill = ifelse(CL075_ctrl_logCPM$logFC > 0, "navyblue", "darkred"), col = "white"), border = F),
+                              # col = list(Donor = c("D1" = "#30123BFF", "D2" = "#1AE4B6FF", "D3" = "#FABA39FF", "D4" = "#7A0403FF"),
+                              #            Condition = c("CC" = "#440154FF", "CL075" = "#2D708EFF", "ctrl" = "#2BB07FFF", "HKCC" = "#C2DF23FF")),
+                              simple_anno_size = unit(0.3, "cm"),
+                              annotation_name_gp= gpar(fontsize = 9))
+
+CL075_ctrl_heatmap <- Heatmap(CL075_ctrl_logCPM[,1:8], name = "z-score", 
+        width = 8*unit(5, "mm"), 
+        height = 60*unit(1.5, "mm"),
+        col =viridis_pal(option = "A")(8), 
+        cluster_rows= F, cluster_columns = T, 
+        show_column_dend = F, show_row_dend = F, 
+        show_row_names = T, row_names_gp = gpar(fontsize = 4),
+        column_names_side = "top", column_names_rot = 45, 
+        column_names_gp = gpar(fontsize = 6),
+        #row_km = 2, 
+        column_km = 2, 
+        border = TRUE, 
+        column_title = NULL, row_title = NULL, 
+        border_gp = gpar(col = "darkgrey"),
+        right_annotation = row_ha)
+#dev.off()
+# draw(HKCC_cc_heatmap)
+pdf("CL075_ctrl_heatmap_modified_20June2023.pdf")
+draw(CL075_ctrl_heatmap)
+dev.off()
+```
+
+
+```{r enrichplot_fns, echo = F}
+##' @method as.data.frame compareClusterResult
+##' @export
+as.data.frame.compareClusterResult <- function(x, ...) {
+    as.data.frame(x@compareClusterResult, ...)
+}
+
+
+##' Prepare pie data for genes in cnetplot.
+##' The function only works for compareClusterResult
+##'
+##' @importFrom DOSE geneID
+##' @param y a data.frame converted from compareClusterResult
+##' @return a data.frame
+##' @noRd
+prepare_pie_gene <- function(y) {
+    gene_pie <- tibble::as_tibble(y[,c("Cluster", "Description", "geneID")])
+    gene_pie$geneID <- strsplit(gene_pie$geneID, '/')
+    gene_pie2 <- as.data.frame(tidyr::unnest(gene_pie, cols=geneID))
+    gene_pie2 <- unique(gene_pie2)
+    prepare_pie_data(gene_pie2, pie =  "equal", type = "gene")
+}
+
+
+##' Prepare pie data for categories in cnetplot/emapplot.
+##' The function only works for compareClusterResult
+##'
+##' @param y a data.frame converted from compareClusterResult
+##' @param pie proportion of clusters in the pie chart, one of 'equal' (default)
+##' or 'Count'
+##' @return a data.frame
+##' @noRd
+prepare_pie_category <- function(y, pie = "equal") {
+    pie <- match.arg(pie, c("equal", "count", "Count"))
+    if (pie == "count") pie <- "Count"
+
+    pie_data <- y[,c("Cluster", "Description", "Count")]
+    pie_data[,"Description"] <- as.character(pie_data[,"Description"])
+    prepare_pie_data(pie_data, pie = pie)
+}
+
+
+
+
+prepare_pie_data <- function(pie_data, pie = "equal",type = "category") {
+    if(type == "category"){
+        ID_unique <- unique(pie_data[,2])
+    } else {
+        ID_unique <- unique(pie_data[,3])
+    }
+
+    Cluster_unique <- unique(pie_data[,1])
+    ID_Cluster_mat <- matrix(0, nrow = length(ID_unique), ncol = length(Cluster_unique))
+    rownames(ID_Cluster_mat) <- ID_unique
+    colnames(ID_Cluster_mat) <- Cluster_unique
+    ID_Cluster_mat <- as.data.frame(ID_Cluster_mat, stringAsFactors = FALSE)
+    if(pie == "Count") {
+        for(i in seq_len(nrow(pie_data))) {
+            ID_Cluster_mat[pie_data[i,2],pie_data[i,1]] <- pie_data[i,3]
+        }
+        for(kk in seq_len(ncol(ID_Cluster_mat))) {
+            ID_Cluster_mat[,kk] <- as.numeric(ID_Cluster_mat[,kk])
+        }
+        return(ID_Cluster_mat)
+    }
+    for(i in seq_len(nrow(pie_data))) {
+        if(type == "category"){
+            ID_Cluster_mat[pie_data[i,2],pie_data[i,1]] <- 1
+        } else {
+            ID_Cluster_mat[pie_data[i,3],pie_data[i,1]] <- 1
+    }
+
+    }
+    return(ID_Cluster_mat)
+}
+
+
+##' create color palette for continuous data
+##'
+##'
+##' @title color_palette
+##' @param colors colors of length >=2
+##' @return color vector
+##' @export
+##' @examples
+##' color_palette(c("red", "yellow", "green"))
+##' @author guangchuang yu
+color_palette <- function(colors) {
+    # has_package("grDevices")
+    grDevices::colorRampPalette(colors)(n = 299)
+}
+
+
+sig_palette <- color_palette(c("red", "yellow", "blue"))
+
+heatmap_palette <- color_palette(c("red", "yellow", "green"))
+
+overlap_ratio <- function(x, y) {
+    x <- unlist(x)
+    y <- unlist(y)
+    length(intersect(x, y))/length(unique(c(x,y)))
+}
+
+fc_readable <- function(x, foldChange = NULL) {
+    if (is.null(foldChange))
+        return(NULL)
+
+    if(x@readable) {
+        gid <- names(foldChange)
+        if (is(x, 'gseaResult')) {
+            ii <- gid %in% names(x@geneList)
+        } else {
+            ii <- gid %in% x@gene
+        }
+        gid[ii] <- x@gene2Symbol[gid[ii]]
+        names(foldChange) <- gid
+    }
+    return(foldChange)
+}
+
+# fc_palette <- function(fc) {
+    # if (all(fc > 0, na.rm=TRUE)) {
+        # palette <- color_palette(c("blue", "red"))
+    # } else if (all(fc < 0, na.rm=TRUE)) {
+        # palette <- color_palette(c("green", "blue"))
+    # } else {
+        ## palette <- color_palette(c("darkgreen", "#0AFF34", "#B3B3B3", "#FF6347", "red"))
+    # }
+    # return(palette)
+# }
+
+update_n <- function(x, showCategory) {
+    if (!is.numeric(showCategory)) {
+        return(showCategory)
+    }
+
+    ## geneSets <- geneInCategory(x) ## use core gene for gsea result
+    n <- showCategory
+    if (nrow(x) < n) {
+        n <- nrow(x)
+    }
+
+    return(n)
+}
+
+extract_geneSets <- function(x, n) {
+    n <- update_n(x, n)
+    geneSets <- geneInCategory(x) ## use core gene for gsea result
+    y <- as.data.frame(x)
+    geneSets <- geneSets[y$ID]
+    names(geneSets) <- y$Description
+    if (is.numeric(n)) {
+        return(geneSets[1:n])
+    }
+    return(geneSets[n]) ## if n is a vector of Description
+}
+
+##' Internal plot function for plotting compareClusterResult
+##'
+##'
+##' @title plotting-clusterProfile
+##' @param clProf.reshape.df data frame of compareCluster result
+##' @param x x variable
+##' @param type one of dot and bar
+##' @param by one of percentage and count
+##' @param title graph title
+##' @param font.size graph font size
+##' @param colorBy one of pvalue or p.adjust
+##' @return ggplot object
+##' @importFrom ggplot2 ggplot
+##' @importFrom ggplot2 aes
+##' @importFrom ggplot2 aes_
+##' @importFrom ggplot2 aes_string
+##' @importFrom ggplot2 geom_bar
+##' @importFrom ggplot2 coord_flip
+##' @importFrom ggplot2 geom_point
+##' @importFrom ggplot2 %+%
+##' @importFrom ggplot2 theme
+##' @importFrom ggplot2 xlab
+##' @importFrom ggplot2 ylab
+##' @importFrom ggplot2 theme_bw
+##' @importFrom ggplot2 element_text
+##' @importFrom ggplot2 ggtitle
+##' @importFrom ggplot2 scale_color_continuous
+##' @importFrom ggplot2 guide_colorbar
+##' @importFrom DOSE theme_dose
+##' @author Guangchuang Yu \url{https://guangchuangyu.github.io}
+plotting.clusterProfile <- function(clProf.reshape.df,
+                                    x = ~Cluster,
+                                    type = "dot",
+                                    colorBy = "p.adjust",
+                                    by = "geneRatio",
+                                    title="",
+                                    font.size=12) {
+    Description <- Percentage <- Count <- Cluster <- GeneRatio <- p.adjust <- pvalue <- NULL # to satisfy codetools
+    if (type == "bar") {
+        if (by == "percentage") {
+            p <- ggplot(clProf.reshape.df,
+                        aes(x=Description, y = Percentage, fill=Cluster))
+        } else if (by == "count") {
+            p <- ggplot(clProf.reshape.df,
+                        aes(x=Description, y = Count, fill=Cluster))
+        } else {
+
+        }
+        p <- p +
+            geom_bar() +
+                coord_flip()
+    }
+    if (type == "dot") {
+        if (by == "rowPercentage") {
+            p <- ggplot(clProf.reshape.df,
+                        aes_(x = x, y = ~Description, size = ~Percentage))
+        } else if (by == "count") {
+            p <- ggplot(clProf.reshape.df,
+                        aes_(x = x, y = ~Description, size = ~Count))
+        } else if (by == "geneRatio") {
+            p <- ggplot(clProf.reshape.df,
+                        aes_(x = x, y = ~Description, size = ~GeneRatio))
+        } else {
+            ## nothing here
+        }
+        if (any(colnames(clProf.reshape.df) == colorBy)) {
+            p <- p +
+                geom_point() +
+                aes_string(color=colorBy) +
+                scale_color_continuous(low="red", high="blue",
+                                       guide=guide_colorbar(reverse=TRUE))
+            ## scale_color_gradientn(guide=guide_colorbar(reverse=TRUE), colors = sig_palette)
+        } else {
+            p <- p + geom_point(colour="steelblue")
+        }
+    }
+    p <- p + xlab("") + ylab("") + ggtitle(title) +
+        theme_dose(font.size)
+    ## theme(axis.text.x = element_text(colour="black", size=font.size, vjust = 1)) +
+    ##     theme(axis.text.y = element_text(colour="black",
+    ##           size=font.size, hjust = 1)) +
+    ##               ggtitle(title)+theme_bw()
+    ## p <- p + theme(axis.text.x = element_text(angle=angle.axis.x,
+    ##                    hjust=hjust.axis.x,
+    ##                    vjust=vjust.axis.x))
+    return(p)
+}
+
+
+
+
+##' Get the distance of the label
+##'
+##' @param dimension one of 1 and 2
+##' @param label_location label_location
+##' @noRd
+get_label_diss <- function(dimension, label_location) {
+    nn <- nrow(label_location)
+    label_dis <- matrix(NA, nrow = nn, ncol = nn)
+    colnames(label_dis) <- rownames(label_dis) <- label_location$label
+    for (i in seq_len(nn - 1)) {
+        for (j in (i + 1):nn) {
+        label_dis[i ,j] <- label_location[i, dimension] -  label_location[j, dimension]
+        }
+    }
+    label_diss <- reshape2::melt(label_dis)
+    label_diss <- label_diss[label_diss[,1] != label_diss[,2], ]
+    label_diss <- label_diss[!is.na(label_diss[,3]), ]
+    label_diss[, 1] <- as.character(label_diss[, 1])
+    label_diss[, 2] <- as.character(label_diss[, 2])
+    return(label_diss)
+}
+
+
+
+# adjust_location <- function(label_location, x_adjust, y_adjust) {
+    # label_diss_x <- get_label_diss(1, label_location)
+    # label_diss_y <- get_label_diss(2, label_location)
+
+    # label_diss_large <- which(abs(label_diss_y[, 3]) < y_adjust) %>%
+        # intersect(which(label_diss_y[, 3] > 0)) %>%
+        # intersect(which(abs(label_diss_x[, 3]) < x_adjust))
+
+    # label_diss_small <- which(abs(label_diss_y[, 3]) < y_adjust) %>%
+        # intersect(which(label_diss_y[, 3] < 0)) %>%
+        # intersect(which(abs(label_diss_x[, 3]) < x_adjust))
+
+    # label_location[label_diss_y[label_diss_large, 1], 2] <- label_location[label_diss_y[label_diss_large, 2], 2] + y_adjust
+    # label_location[label_diss_y[label_diss_small, 1], 2] <- label_location[label_diss_y[label_diss_small, 2], 2] - y_adjust
+    # return(label_location)
+# }
+
+
+#' ep_str_wrap internal string wrapping function
+#' @param string the string to be wrapped
+#' @param width the maximum number of characters before wrapping to a new line
+#' @noRd
+ep_str_wrap <- function(string, width) {
+    x <- gregexpr(' ', string)
+    vapply(seq_along(x),
+           FUN = function(i) {
+               y <- x[[i]]
+               n <- nchar(string[i])
+               len <- (c(y,n) - c(0, y)) ## length + 1
+               idx <- len > width
+               j <- which(!idx)
+               if (length(j) && max(j) == length(len)) {
+                   j <- j[-length(j)]
+               }
+               if (length(j)) {
+                   idx[j] <- len[j] + len[j+1] > width
+               }
+               idx <- idx[-length(idx)] ## length - 1
+               start <- c(1, y[idx] + 1)
+               end <- c(y[idx] - 1, n)
+               words <- substring(string[i], start, end)
+               paste0(words, collapse="\n")
+           },
+           FUN.VALUE = character(1)
+    )
+}
+
+#' default_labeller
+#'
+#' default labeling function that uses the
+#' internal string wrapping function `ep_str_wrap`
+#' @noRd
+default_labeller <- function(n) {
+    function(str){
+        str <- gsub("_", " ", str)
+        ep_str_wrap(str, n)
+    }
+}
+
+
+list2df <- function(inputList) {
+    # ldf <- lapply(1:length(inputList), function(i) {
+    ldf <- lapply(seq_len(length(inputList)), function(i) {
+        data.frame(categoryID=rep(names(inputList[i]),
+                                  length(inputList[[i]])),
+                   Gene=inputList[[i]])
+    })
+
+    do.call('rbind', ldf)
+}
+
+```
+
+<!-- # Visualisation: GO enrichment analysis -->
+<!-- ## heatplot fn -->
+
+<!-- ```{r} -->
+<!-- my_heatplot <- function(x, showCategory=30, foldChange=NULL, -->
+<!--                                   label_format = 30) { -->
+
+<!--     label_func <- default_labeller(label_format) -->
+<!--     if(is.function(label_format)) { -->
+<!--         label_func <- label_format -->
+<!--     } -->
+
+<!--     n <- update_n(x, showCategory) -->
+<!--     geneSets <- extract_geneSets(x, n) -->
+
+<!--     foldChange <- fc_readable(x, foldChange) -->
+<!--     d <- list2df(geneSets) -->
+
+<!--     if (!is.null(foldChange)) { -->
+<!--         d$foldChange <- foldChange[as.character(d[,2])] -->
+<!--         ## palette <- fc_palette(d$foldChange) -->
+<!--         p <- ggplot(d, aes_(~Gene, ~categoryID)) + -->
+<!--             geom_tile(aes_(fill = ~foldChange), color = "white") + -->
+<!--             scale_fill_viridis_c(name = "log2 fold change")  -->
+<!--         ## scale_fill_gradientn(name = "fold change", colors = palette) -->
+<!--     } -->
+<!--     # } else { -->
+<!--     #     p <- ggplot(d, aes_(~Gene, ~categoryID)) + geom_tile(color = 'white') -->
+<!--     # } -->
+<!--     p + xlab(NULL) + ylab(NULL) + theme_minimal() + -->
+<!--         scale_y_discrete(labels = label_func) + -->
+<!--         theme(panel.grid.major = element_blank(), -->
+<!--               axis.text.x=element_text(size = 5, angle = 60, hjust = 1), -->
+<!--               axis.text.y = element_text(size = 6), -->
+<!--               legend.title = element_text(size=7), -->
+<!--               legend.text = element_text(size=7)) -->
+<!-- } -->
+
+<!-- ``` -->
+
+## GO enrichment analysis 
+
+```{r, echo = F}
+
+dgelrt <- tr.CL075vsctrl
+geneIDs <- biomaRt::select(org.Hs.eg.db, 
+       keys = rownames(dgelrt),
+       columns = c("ENTREZID", "ENSEMBL"),
+       keytype = "ENSEMBL")
+
+  dgelrt$genes <- dgelrt$genes %>% 
+    tibble::rownames_to_column("ENSEMBL") %>% 
+    left_join(., geneIDs)
+  
+  geneList <- dgelrt$table %>% 
+    tibble::rownames_to_column("ENSEMBL") %>% 
+    left_join(., dgelrt$genes) %>% 
+    mutate(FDR = p.adjust(PValue, method = "BH"))
+    
+  gene_pos <- geneList %>% 
+    filter(FDR <= 0.1 & logFC >= 1) %>% 
+    distinct(ENSEMBL, .keep_all = T) %>% 
+    dplyr::select(ENTREZID, logFC) %>% 
+    arrange(desc(logFC)) %>% 
+    tibble::deframe()
+  
+  gene_neg <- geneList %>% 
+    filter(FDR <= 0.1 & logFC <= 1) %>% 
+    distinct(ENSEMBL, .keep_all = T) %>% 
+    dplyr::select(ENTREZID, logFC) %>% 
+    arrange(desc(logFC)) %>% 
+    tibble::deframe()
+  
+  # ggo <- groupGO(gene     = gene,
+  #                OrgDb    = org.Hs.eg.db,
+  #                ont      = "BP",
+  #                level    = 3,
+  #                readable = TRUE)
+  
+  ego_pos <- enrichGO(gene          = names(gene_pos),
+                  universe      = geneList$ENTREZID,
+                  OrgDb         = org.Hs.eg.db,
+                  ont           = "BP",
+                  pAdjustMethod = "BH",
+                  pvalueCutoff  = 0.01,
+                  qvalueCutoff  = 0.05,
+                  keyType       = "ENTREZID",
+                  readable      = TRUE)
+  
+  ego_neg <- enrichGO(gene          = names(gene_neg),
+                  universe      = geneList$ENTREZID,
+                  OrgDb         = org.Hs.eg.db,
+                  ont           = "BP",
+                  pAdjustMethod = "BH",
+                  pvalueCutoff  = 0.01,
+                  qvalueCutoff  = 0.05,
+                  keyType       = "ENTREZID",
+                  readable      = TRUE)
+  
+  write.csv2(ego_pos, "CL075_vs_ctrl_GOenrich_positiveLog2FC.csv", row.names = F, quote = F)
+  write.csv2(ego_neg, "CL075_vs_ctrl_GOenrich_negativeLog2FC.csv", row.names = F, quote = F)
+  #print(head(ego))
+  
+  # library(topGO)
+  # 
+  # gene_sym <- geneList %>% 
+  #   filter(FDR <= 0.05 & abs(logFC) > 2) %>% 
+  #   distinct(ENSEMBL, .keep_all = T) %>% 
+  #   dplyr::select(Symbol, logFC) %>% 
+  #   arrange(desc(logFC)) %>% 
+  #   tibble::deframe()
+  # 
+  # genes_int <- names(gene_sym)
+  # genes_uni <- geneList$Symbol
+  # h_genelist <- as.integer(genes_uni %in% genes_int)
+  # names(h_genelist) <- genes_uni
+  # 
+  #   
+  # topDiffGenes <- function(allScore) 
+  # {
+  #   return(allScore == 1)
+  # }
+  # x <- topDiffGenes(h_genelist)
+  # 
+  #   hGOdata <- new("topGOdata",
+  #                  ontology = "MF",
+  #                  allGenes = h_genelist,
+  #                  nodeSize = 10,
+  #                  annotationFun = annFUN.org,
+  #                  geneSelectionFun = topDiffGenes,
+  #                  mapping = "org.Hs.eg",
+  #                  ID = "symbol")
+  #   
+  #   resultKS=runTest(hGOdata, algorithm='weight01', statistic='KS')
+  #   allGO=usedGO(hGOdata)
+  #   all_res=GenTable(hGOdata, KS=resultKS, orderBy="KS", topNodes=length(allGO), numChar = 1000)
+  #   ################################################################
+  #   
+  #   GenesForGOterm <- c()
+  #   myterms = all_res$GO.ID
+  #   mygenes <- genesInTerm(hGOdata, myterms)
+  #   for (i in 1:length(myterms))
+  #   {
+  #     myterm <- mygenes[myterms[i]][[1]]
+  #     mygenesforterm <- myterm[which(myterm %in% genes_int == TRUE)]
+  #     orterm <- paste(mygenesforterm, collapse=',')
+  #     GenesForGOterm[i] <- mygenesforterm
+  #   }
+  #   
+  #   all_res$GenesForGOterm <- GenesForGOterm
+  #   write.table(all_res, "HKCC_CC_GOenrichment_topGO_MF.csv", sep = '\t', row.names = F)
+  
+  # ego2 <- gseGO(geneList     = geneList,
+  #               OrgDb        = org.Hs.eg.db,
+  #               ont          = "BP",
+  #               minGSSize    = 100,
+  #               maxGSSize    = 500,
+  #               pvalueCutoff = 0.05,
+  #               verbose      = FALSE
+  #               )
+  # ego2_r <- setReadable(ego2, OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+  # print(head(ego2_r))
+  
+  # print(barplot(ego, showCategory=20, font.size = 7) )
+  # # mutate(ego, qscore = -log(p.adjust, base=10)) %>% 
+  # #     barplot(x="qscore", font.size = 7) %>%  print()
+  # print(dotplot(ego, showCategory=30, font.size = 6) + ggtitle(paste("Over-representation analysis -", comparison)))
+  # #print(dotplot(ego2, showCategory=30, font.size = 6) + ggtitle("dotplot for GSEA"))
+  # 
+  egox <- setReadable(ego, 'org.Hs.eg.db', 'ENTREZID')
+  #write.table(egox, "HKCC_CC_GOenrichment.csv", sep = "\t", row.names = F, quote = F)
+  #p1 <- heatplot(egox, showCategory=5)
+ # p2 <- heatplot(egox, foldChange=geneList, showCategory=15)
+  #print(cowplot::plot_grid(p1, p2, ncol=1, labels=LETTERS[1:2]))
+#  print(p2)
+ # my_heatplot(egox, showCategory = 15, foldChange = geneList, label_format = 15)
+ # ggsave("heatplot_HKCC_CC.svg", width = 22, height = 10, units = "cm")
+
+  
+  #print(p2)
+  
+
+```
+
+### GO enriched terms treeplot 
+
+```{r}
+treeplot.enrichResult <- function(x, showCategory = 30,
+                                  color = "p.adjust",
+                                  nWords = 4, nCluster = 5,
+                                  cex_category = 1,
+                                  label_format = 30, xlim = NULL,
+                                  fontsize = 4, offset = NULL,
+                                  offset_tiplab = 0.35, 
+                                  hclust_method = "ward.D",
+                                  #group_color = viridis_pal(option = "A")(10)[3:7],
+                                  group_color = brewer.pal(11, 'RdYlBu')[c(1,2,3,10,11)], 
+                                  extend = 0.3, hilight = TRUE, ...) {
+    group <- p.adjust <- count<- NULL
+
+    if (class(x) == "gseaResult")
+        x@result$Count <- x$core_enrichment %>%
+            strsplit(split = "/")  %>%
+            vapply(length, FUN.VALUE = 1)   
+    n <- update_n(x, showCategory)
+    if (is.numeric(n)) {
+        keep <- seq_len(n)
+    } else {
+        keep <- match(n, rownames(x@termsim))
+    }
+
+    if (length(keep) == 0) {
+        stop("no enriched term found...")
+    }
+    ## Fill the upper triangular matrix completely
+    termsim2 <- fill_termsim(x, keep)
+
+    ## Use the ward.D method to avoid overlapping ancestor nodes of each group
+    hc <- stats::hclust(stats::as.dist(1- termsim2),
+                        method = hclust_method)
+    clus <- stats::cutree(hc, nCluster)
+    d <- data.frame(label = names(clus),
+        #node = seq_len(length(clus)),
+        color = x[keep, as.character(color)],
+        count = x$Count[keep])
+
+    ## Group the nodes.
+    p <- group_tree(hc, clus, d, offset_tiplab, nWords, 
+        label_format, offset, fontsize, group_color, extend, hilight)
+    if(is.null(xlim)) xlim <- c(0, 3 * p$data$x[1])
+    p + coord_cartesian(xlim = xlim) +
+        ggnewscale::new_scale_colour() +
+        geom_tippoint(aes(color = color, size = count)) +
+        scale_colour_continuous(low="darkred", high="lightgreen", name = color, 
+            guide = guide_colorbar(reverse = TRUE)) +
+        scale_size_continuous(name = "number of genes",
+                              range = c(3, 8) * cex_category)
+}
+
+
+##' @rdname treeplot
+##' @param pie Proportion of clusters in the pie chart, one of
+##' 'equal' (default) and 'Count'.
+##' @param split Separate result by 'category' variable.
+##' @param legend_n Number of circle in legend, the default value is 3.
+##' @importFrom ggtree nodepie
+##' @importFrom ggtree geom_inset
+##' @importFrom ggplot2 scale_fill_manual
+treeplot.compareClusterResult <-  function(x, showCategory = 5,
+                                      color = "p.adjust",
+                                      nWords = 4, nCluster = 5,
+                                      cex_category = 1, split = NULL,
+                                      label_format = 30, xlim = NULL,
+                                      fontsize = 4, offset = NULL, pie = "equal",
+                                      legend_n = 3, offset_tiplab = 0.5, 
+                                      hclust_method = "ward.D", group_color = NULL, 
+                                      extend = 0.3, hilight = TRUE, ...) {
+    has_pairsim(x)
+    group <- NULL
+    # y <- get_selected_category(showCategory, x, split)  
+    y <- fortify(x, showCategory = showCategory,
+             includeAll = TRUE, split = split)
+    y$Cluster <- sub("\n.*", "", y$Cluster)
+    ## Data structure transformation, combining the same ID (Description) genes
+    merged_ggData <- merge_compareClusterResult(y)
+    ID_Cluster_mat <- prepare_pie_category(y, pie=pie)
+    ## Fill the upper triangular matrix completely
+    termsim2 <- fill_termsim(x, rownames(ID_Cluster_mat))
+    hc <- stats::hclust(stats::as.dist(1- termsim2),
+                        method = hclust_method)
+    clus <- stats::cutree(hc, nCluster)
+    rownames(merged_ggData) <- merged_ggData$Description
+    d <- data.frame(label = names(clus),
+        count = merged_ggData[names(clus), "Count"])
+        
+    p <- group_tree(hc, clus, d, offset_tiplab, nWords, 
+        label_format, offset, fontsize, group_color, extend, hilight)
+    p_data <- as.data.frame(p$data)
+    p_data <- p_data[which(!is.na(p_data$label)), ]
+    rownames(p_data) <- p_data$label
+    p_data <- p_data[rownames(ID_Cluster_mat), ]
+
+    ID_Cluster_mat$radius <- sqrt(p_data$count / sum(p_data$count) * cex_category)
+    ID_Cluster_mat$x <- p_data$x
+    ID_Cluster_mat$y <- p_data$y
+    ID_Cluster_mat$node <- p_data$node
+    if(is.null(xlim)) xlim <- c(0, 5 * p_data$x[1])
+
+    # p + ggnewscale::new_scale_colour() +
+    p + ggnewscale::new_scale_fill() +
+        scatterpie::geom_scatterpie(ggplot2::aes_(x=~x,y=~y,r=~radius), data=ID_Cluster_mat,
+                cols=colnames(ID_Cluster_mat)[1:(ncol(ID_Cluster_mat)-4)],color=NA) +
+        # scatterpie::geom_scatterpie_legend(cex_category * ID_Cluster_mat$radius,
+        scatterpie::geom_scatterpie_legend(ID_Cluster_mat$radius,
+            x = 0.8, y = 0.1, n = legend_n,
+            labeller = function(x) round(sum(p_data$count) * x^2 / cex_category)) +
+        coord_equal(xlim = xlim) +
+        labs(fill = "Cluster")
+}
+
+
+
+
+##' Fill the upper triangular matrix completely
+##'
+##' @param x enrichment result
+##' @param keep keep value
+##'
+##' @return a data.frame
+##' @noRd
+fill_termsim <- function(x, keep) {
+    termsim <- x@termsim[keep, keep]
+    termsim[which(is.na(termsim))] <- 0
+    termsim2 <- termsim + t(termsim)
+    for ( i in seq_len(nrow(termsim2)))
+        termsim2[i, i] <- 1
+    return(termsim2)
+}
+
+##' Add geom_cladelab() to a ggtree object.
+##'
+##' @param p a ggtree object
+##' @param nWords the number of words in the cluster tags
+##' @param label_format a numeric value sets wrap length, alternatively a
+##' custom function to format axis labels.
+##' @param offset distance bar and tree, offset of bar and text from the clade.
+##'
+##' @return a ggtree object
+##' @noRd
+add_cladelab <- function(p, nWords, label_format, offset, roots, 
+                         fontsize, group_color, cluster_color, pdata, extend, hilight) {
+    cluster_label <- sapply(cluster_color, get_wordcloud, ggData = pdata,
+                        nWords = nWords)
+    label_func <- default_labeller(label_format)
+    if (is.function(label_format)) {
+        label_func <- label_format
+    }
+    cluster_label <- label_func(cluster_label)
+    #names(cluster_label) <- cluster_color
+    if(is.null(offset)) offset <- p$data$x[1]
+    n_color <- length(levels(cluster_color)) - length(cluster_color)
+    if (is.null(group_color)) {
+        color2 <- scales::hue_pal(h = c(0, 270), l = 40)(length(roots) + n_color)
+        if (n_color > 0) color2 <- color2[-seq_len(n_color)]
+    } else {
+        color2 <- group_color
+    }
+    df <- data.frame(node = as.numeric(roots),
+        labels = cluster_label,
+        cluster=cluster_color,
+        # color = scales::hue_pal()(length(roots) + n_color)[-seq_len(n_color)]
+        color = color2
+    )
+    
+    p <- p + ggnewscale::new_scale_colour() + 
+        geom_cladelab(
+            data = df,
+            mapping = ggplot2::aes_(node =~ node, label =~ labels, color =~ cluster),
+            textcolor = "black",
+            extend = extend,
+            show.legend = F,
+            fontsize = fontsize, offset = offset) + 
+            scale_color_manual(values = df$color, 
+                               guide = FALSE)
+    if (hilight) {
+        p <- p + ggtree::geom_hilight(
+            data = df,
+            mapping = ggplot2::aes_(node =~ node, fill =~ cluster),
+            show.legend = F) + 
+            scale_fill_manual(values = df$color, 
+                               guide = FALSE)
+
+    }
+    
+    return(p)
+ 
+}
+
+##' Group the nodes.
+##'
+##' @return a ggtree object
+##' @noRd
+group_tree <- function(hc, clus, d, offset_tiplab, nWords, 
+                       label_format, offset, fontsize, group_color, extend, hilight) {
+    group <- NULL
+    # cluster data
+    dat <- data.frame(name = names(clus), cls=paste0("cluster_", as.numeric(clus)))
+    grp <- apply(table(dat), 2, function(x) names(x[x == 1]))  
+    p <- ggtree(hc, branch.length = "none", show.legend=FALSE)
+    # extract the most recent common ancestor
+    noids <- lapply(grp, function(x) unlist(lapply(x, function(i) ggtree::nodeid(p, i))))
+    roots <- unlist(lapply(noids, function(x) ggtree::MRCA(p, x)))
+    # cluster data
+    p <- ggtree::groupOTU(p, grp, "group") + ggplot2::aes_(color =~ group)
+    pdata <- data.frame(name = p$data$label, color2 = p$data$group)
+    pdata <- pdata[!is.na(pdata$name), ]
+    cluster_color <- unique(pdata$color2)
+    n_color <- length(levels(cluster_color)) - length(cluster_color)
+    if (!is.null(group_color)) {
+        color2 <- c(rep("black", n_color), group_color)
+        p <- p + scale_color_manual(values = color2, guide = FALSE)
+    }
+    
+    p <- p %<+% d +
+        geom_tiplab(offset = offset_tiplab, hjust = 0, show.legend = FALSE, align=TRUE)
+
+    p <- add_cladelab(p, nWords, label_format, offset, roots, 
+        fontsize, group_color, cluster_color, pdata, extend, hilight) 
+    return(p)
+}
+
+get_word_freq <- function(wordd){     
+    dada <- strsplit(wordd, " ")
+    didi <- table(unlist(dada))
+    didi <- didi[order(didi, decreasing = TRUE)]
+    # Get the number of each word
+    word_name <- names(didi)
+    fun_num_w <- function(ww){
+        sum(vapply(dada, function(w){ww %in% w}, FUN.VALUE = 1))
+    }
+    word_num <- vapply(word_name, fun_num_w, FUN.VALUE = 1)
+    word_w <- word_num[order(word_num, decreasing = TRUE)]
+}
+
+##' Use wordcloud algorithm to get group tags
+##' 
+##' @param cluster a cluster name
+##' @param ggData the data section of the ggraph object, 
+##' which contains clustering information.
+##' @param nWords the number of words in the cluster tags 
+##' @importFrom magrittr %>%
+##' @noRd
+get_wordcloud <- function(cluster, ggData, nWords){
+    words <- ggData$name %>%
+        gsub(" in ", " ", .) %>%
+        gsub(" [0-9]+ ", " ", .) %>%
+        gsub("^[0-9]+ ", "", .) %>%
+        gsub(" [0-9]+$", "", .) %>%
+        gsub(" [A-Za-z] ", " ", .) %>%
+        gsub("^[A-Za-z] ", "", .) %>%
+        gsub(" [A-Za-z]$", "", .) %>%
+        gsub(" / ", " ", .) %>%
+        gsub(" and ", " ", .) %>%
+        gsub(" of ", " ", .) %>%
+        gsub(",", " ", .) %>%
+        gsub(" - ", " ", .)
+    net_tot <- length(words)
+
+    clusters <- unique(ggData$color2)
+    words_i <- words[which(ggData$color2 == cluster)]
+
+    sel_tot <- length(words_i)
+    sel_w <- get_word_freq(words_i)
+    net_w_all <- get_word_freq(words)
+    net_w <- net_w_all[names(sel_w)]
+    tag_size <- (sel_w/sel_tot)/(net_w/net_tot)
+    tag_size <- tag_size[order(tag_size, decreasing = TRUE)]
+    nWords <- min(nWords, length(tag_size))
+    tag <- names(tag_size[seq_len(nWords)])
+
+    # Order of words
+    dada <- strsplit(words_i, " ")
+    len <- vapply(dada, length, FUN.VALUE=1)
+    rank <- NULL
+    for(i in seq_len(sel_tot)) {
+        rank <- c(rank, seq_len(len[i]))
+    }
+
+    word_data <- data.frame(word = unlist(dada), rank = rank)
+    word_rank1 <- stats::aggregate(rank ~ word, data = word_data, sum)
+    rownames(word_rank1) <- word_rank1[, 1]
+
+    word_rank1 <- word_rank1[names(sel_w), ]
+    # Get an average ranking order
+    word_rank1[, 2] <- word_rank1[, 2]/as.numeric(sel_w)
+    tag_order <- word_rank1[tag, ]
+    tag_order <- tag_order[order(tag_order[, 2]), ]
+    tag_clu_i <- paste(tag_order$word, collapse=" ")
+}
+
+
+
+egox2 <- enrichplot::pairwise_termsim(egox)
+  p1 <- treeplot.enrichResult(egox2, fontsize = 2, title = paste(comparison, " - treeplot"), 
+                 showCategory = 30, label_format = 80, nWords = 0)
+  #p2 <- treeplot(egox2, hclust_method = "average", fontsize = 2)
+  print(p1)
+ # ggsave("treeplot_HKCC_CC.svg", width = 30, height = 20, units = "cm")
+
+```
+
+<!-- ## emapplot fn and plot -->
+
+<!-- ```{r emapplot} -->
+
+<!-- ##' Get the similarity matrix -->
+<!-- ##' -->
+<!-- ##' @param y a data.frame of enrichment result -->
+<!-- ##' @param geneSets a list, the names of geneSets are term ids, -->
+<!-- ##' and every object is a vertor of genes -->
+<!-- ##' @param method method of calculating the similarity between nodes, -->
+<!-- ##' one of "Resnik", "Lin", "Rel", "Jiang" , "Wang"  and -->
+<!-- ##' "JC" (Jaccard similarity coefficient) methods -->
+<!-- ##' @param semData GOSemSimDATA object -->
+<!-- ##' @noRd -->
+<!-- get_ww <- function(y, geneSets, method, semData = NULL) { -->
+<!--     id <- y[, "ID"] -->
+<!--     geneSets <- geneSets[id] -->
+<!--     n <- nrow(y) -->
+<!--     y_id <- unlist(strsplit(y$ID[1], ":"))[1] -->
+<!--     ## Choose the method to calculate the similarity -->
+<!--     if (method == "JC") { -->
+<!--         w <- matrix(NA, nrow=n, ncol=n) -->
+<!--         colnames(w) <- rownames(w) <- y$Description -->
+<!--         for (i in seq_len(n-1)) { -->
+<!--             for (j in (i+1):n) { -->
+<!--                 w[i,j] <- overlap_ratio(geneSets[id[i]], geneSets[id[j]]) -->
+<!--             } -->
+<!--         } -->
+<!--         return(w) -->
+<!--     } -->
+
+<!--     if (y_id == "GO") { -->
+<!--         if(is.null(semData)) { -->
+<!--             stop("The semData parameter is missing, -->
+<!--                 and it can be obtained through godata function in GOSemSim package.") -->
+<!--         } -->
+<!--         w <- GOSemSim::mgoSim(id, id, semData=semData, measure=method, -->
+<!--                               combine=NULL) -->
+<!--     } -->
+
+<!--     if (y_id == "DOID") w <- DOSE::doSim(id, id, measure=method) -->
+<!--     return(w) -->
+<!-- } -->
+
+
+<!-- #' Check whether the similarity matrix exists -->
+<!-- #' -->
+<!-- #' @param x result of enrichment analysis -->
+<!-- #' -->
+<!-- has_pairsim <- function(x) { -->
+<!--     if (length(x@termsim) == 0) { -->
+<!--         error_message <- paste("Term similarity matrix not available.", -->
+<!--             "Please use pairwise_termsim function to", -->
+<!--             "deal with the results of enrichment analysis.") -->
+<!--         # error_message <- gsub("[ ]+", " ", error_message) -->
+<!--         # error_message <- gsub("[\r\n]", "", error_message) -->
+<!--         stop(error_message) -->
+<!--     } -->
+
+<!-- } -->
+
+
+<!-- ##' Get graph.data.frame() result -->
+<!-- ##' -->
+<!-- ##' @importFrom igraph graph.empty -->
+<!-- ##' @importFrom igraph graph.data.frame -->
+<!-- ##' @param y a data.frame of clusterProfiler result -->
+<!-- ##' @param geneSets a list gene sets with the names of enrichment IDs -->
+<!-- ##' @param color a string, the column name of y for nodes colours -->
+<!-- ##' @param cex_line scale of line width -->
+<!-- ##' @param min_edge minimum percentage of overlap genes to display the edge, -->
+<!-- ##' should between 0 and 1, default value is 0.2 -->
+<!-- ##' @param pair_sim semantic similarity matrix -->
+<!-- ##' @param method method of calculating the similarity between nodes, -->
+<!-- ##' one of "Resnik", "Lin", "Rel", "Jiang" , "Wang"  and -->
+<!-- ##' "JC" (Jaccard similarity coefficient) methods -->
+<!-- ##' @return result of graph.data.frame() -->
+<!-- ##' @noRd -->
+<!-- emap_graph_build <- function(y, geneSets, color, cex_line, min_edge,  -->
+<!--                              pair_sim  = NULL, method = NULL) { -->
+
+<!--     if (!is.numeric(min_edge) | min_edge < 0 | min_edge > 1) { -->
+<!--     	stop('"min_edge" should be a number between 0 and 1.') -->
+<!--     } -->
+
+<!--     if (is.null(dim(y)) | nrow(y) == 1) {  # when just one node -->
+<!--         g <- graph.empty(0, directed=FALSE) -->
+<!--         g <- add_vertices(g, nv = 1) -->
+<!--         V(g)$name <- as.character(y$Description) -->
+<!--         V(g)$color <- "red" -->
+<!--     } else { -->
+<!--         w <- pair_sim -->
+<!--         if (method == "JC") { -->
+<!--             w <- w[as.character(y$Description), as.character(y$Description)] -->
+<!--         } else { -->
+<!--             w <- w[y$ID, y$ID] -->
+<!--         } -->
+<!--     } -->
+
+<!--     wd <- reshape2::melt(w) -->
+<!--     wd <- wd[wd[,1] != wd[,2],] -->
+<!--     # remove NA -->
+<!--     wd <- wd[!is.na(wd[,3]),] -->
+<!--     if (method != "JC") { -->
+<!--         # map id to names -->
+<!--         wd[, 1] <- y[wd[, 1], "Description"] -->
+<!--         wd[, 2] <- y[wd[, 2], "Description"] -->
+<!--     } -->
+
+<!--     g <- igraph::graph.data.frame(wd[, -3], directed=FALSE) -->
+<!--     igraph::E(g)$width <- sqrt(wd[, 3] * 5) * cex_line -->
+
+<!--     # Use similarity as the weight(length) of an edge -->
+<!--     igraph::E(g)$weight <- wd[, 3] -->
+<!--     g <- igraph::delete.edges(g, E(g)[wd[, 3] < min_edge]) -->
+<!--     idx <- unlist(sapply(V(g)$name, function(x) which(x == y$Description))) -->
+<!--     cnt <- sapply(geneSets[idx], length) -->
+<!--     igraph::V(g)$size <- cnt -->
+<!--     colVar <- y[idx, color] -->
+<!--     igraph::V(g)$color <- colVar -->
+<!--     return(g) -->
+<!-- } -->
+
+
+
+<!-- ##' Get an iGraph object -->
+<!-- ##' -->
+<!-- ##' @param x enrichment result. -->
+<!-- ##' @param y as.data.frame(x). -->
+<!-- ##' @param n number of enriched terms to display. -->
+<!-- ##' @param color variable that used to color enriched terms, e.g. pvalue, -->
+<!-- ##' p.adjust or qvalue. -->
+<!-- ##' @param cex_line scale of line width. -->
+<!-- ##' @param min_edge minimum percentage of overlap genes to display the edge, -->
+<!-- ##' should between 0 and 1, default value is 0.2. -->
+<!-- ##' -->
+<!-- ##' @return an iGraph object -->
+<!-- get_igraph <- function(x, y,  n, color, cex_line, min_edge){ -->
+<!--     geneSets <- DOSE::geneInCategory(x) ## use core gene for gsea result -->
+<!--     if (is.numeric(n)) { -->
+<!--         y <- y[1:n, ] -->
+<!--     } else { -->
+<!--         y <- y[match(n, y$Description),] -->
+<!--         n <- length(n) -->
+<!--     } -->
+
+<!--     if (n == 0) { -->
+<!--         stop("no enriched term found...") -->
+<!--     } -->
+
+<!--     g <- emap_graph_build(y = y, geneSets = geneSets, color = color, -->
+<!--              cex_line = cex_line, min_edge = min_edge, -->
+<!--              pair_sim = x@termsim, method = x@method) -->
+<!-- } -->
+
+
+
+<!-- ##' @rdname emapplot -->
+<!-- ##' @importFrom igraph graph.empty -->
+<!-- ##' @importFrom igraph add_vertices -->
+<!-- ##' @importFrom igraph graph.data.frame -->
+<!-- ##' @importFrom igraph delete.edges -->
+<!-- ##' @importFrom igraph V "V<-" -->
+<!-- ##' @importFrom igraph E "E<-" -->
+<!-- ##' @importFrom reshape2 melt -->
+<!-- ##' @importFrom ggplot2 aes_ -->
+<!-- ##' @importFrom ggplot2 scale_color_gradientn -->
+<!-- ##' @importFrom ggplot2 guide_colorbar -->
+<!-- ##' @importFrom ggplot2 scale_size -->
+<!-- ##' @importFrom ggplot2 theme_void -->
+<!-- ##' @importFrom ggraph ggraph -->
+<!-- ##' @importFrom ggraph geom_node_point -->
+<!-- ##' @importFrom ggraph geom_node_text -->
+<!-- ##' @importFrom ggraph geom_edge_link -->
+<!-- ##' @importFrom DOSE geneInCategory -->
+<!-- ##' @param node_scale scale of node, this parameter has been changed to cex_category -->
+<!-- ##' @param line_scale scale of line width, this parameter has been changed to cex_line -->
+<!-- ##' @param cex_line scale of line width -->
+<!-- ##' @param min_edge minimum percentage of overlap genes to display the edge, -->
+<!-- ##' should between 0 and 1, default value is 0.2 -->
+<!-- ##' @param node_label_size size of node label, this parameter has been -->
+<!-- ##' changed to cex_label_category -->
+<!-- ##' @param cex_label_category scale of category node label size -->
+<!-- ##' @param cex_category number indicating the amount by which plotting category -->
+<!-- ##' nodes should be scaled relative to the default. -->
+<!-- ##' @author Guangchuang Yu -->
+<!-- emapplot.enrichResult <- function(x, showCategory = 30, color="p.adjust", -->
+<!--     layout = "nicely", node_scale = NULL, line_scale = NULL, min_edge=0.2, -->
+<!--     node_label_size = NULL, cex_label_category  = 1, cex_category = NULL, -->
+<!--     cex_line = NULL) { -->
+
+<!--     has_pairsim(x) -->
+<!--     if (!is.null(node_label_size))  -->
+<!--         message("node_label_size parameter has been changed to 'cex_label_category'") -->
+<!--     # if (is.null(cex_label_category)) { -->
+<!--         # if (!is.null(node_label_size)) { -->
+<!--             # cex_label_category <- node_label_size -->
+<!--         # } else { -->
+<!--             # cex_label_category <- 5 -->
+<!--         # } -->
+<!--     # } -->
+
+<!--     if (!is.null(node_scale))  -->
+<!--         message("node_scale parameter has been changed to 'cex_category'") -->
+<!--     if (is.null(cex_category)) { -->
+<!--         if (!is.null(node_scale)) { -->
+<!--             cex_category <- node_scale -->
+<!--         } else { -->
+<!--             cex_category <- 1 -->
+<!--         } -->
+<!--     } -->
+
+<!--     if (!is.null(line_scale))  -->
+<!--         message("line_scale parameter has been changed to 'cex_line'") -->
+<!--     if (is.null(cex_line)) { -->
+<!--         if (!is.null(line_scale)) { -->
+<!--             cex_line <- line_scale -->
+<!--         } else { -->
+<!--             cex_line <- 1 -->
+<!--         } -->
+<!--     } -->
+<!--     label_category <- 5 -->
+<!--     n <- update_n(x, showCategory) -->
+<!--     # geneSets <- geneInCategory(x) ## use core gene for gsea result -->
+
+
+<!--     y <- as.data.frame(x) -->
+<!--     g <- get_igraph(x=x, y=y, n=n, color=color, cex_line=cex_line, -->
+<!--                     min_edge=min_edge) -->
+<!--     if(n == 1) { -->
+<!--         return(ggraph(g) + geom_node_point(color="red", size=5) + -->
+<!--                geom_node_text(aes_(label=~name))) -->
+<!--     } -->
+
+<!--     p <- ggraph(g, layout=layout) -->
+<!--     if (length(E(g)$width) > 0) { -->
+<!--         p <- p + geom_edge_link(alpha=.5, aes_(width=~I(width)), -->
+<!--                                 colour='grey') -->
+<!--     } -->
+<!--     p <- p + geom_node_point(aes_(color=~color, size=~size)) -->
+
+<!--     if (utils::packageVersion("ggrepel") >= "0.9.0") { -->
+<!--         p <- p + geom_node_text(aes_(label=~name), repel=TRUE, -->
+<!--             size = label_category * cex_label_category, bg.color = "white") -->
+<!--     } else { -->
+<!--         p <- p + geom_node_text(aes_(label=~name), repel=TRUE, -->
+<!--             size = label_category * cex_label_category) -->
+<!--     } -->
+<!--         # geom_node_text(aes_(label=~name), repel=TRUE) + theme_void() + -->
+<!--     p + theme_void() + -->
+<!--         scale_color_continuous(low="red", high="blue", name = color, -->
+<!--                                guide=guide_colorbar(reverse=TRUE)) + -->
+<!--         scale_size(range=c(3, 8) * cex_category) -->
+
+<!-- } -->
+
+
+
+<!-- ##' Merge the compareClusterResult file -->
+<!-- ##' -->
+<!-- ##' @param yy a data.frame of clusterProfiler result -->
+<!-- ##' -->
+<!-- ##' @return a data.frame -->
+<!-- ##' @noRd -->
+<!-- merge_compareClusterResult <- function(yy) { -->
+<!--     yy_union<- yy[!duplicated(yy$ID),] -->
+<!--     yy_ids <- lapply(split(yy, yy$ID), function(x) { -->
+<!--         ids <- unique(unlist(strsplit(x$geneID, "/"))) -->
+<!--         cnt <- length(ids) -->
+<!--         list(ID=paste0(ids, collapse="/"), cnt=cnt) -->
+<!--     }) -->
+
+<!--     ids <- vapply(yy_ids, function(x) x$ID, character(1)) -->
+<!--     cnt <- vapply(yy_ids, function(x) x$cnt, numeric(1)) -->
+
+<!--     yy_union$geneID <- ids[yy_union$ID] -->
+<!--     yy_union$Count <- cnt[yy_union$ID] -->
+<!--     yy_union$Cluster <- NULL -->
+<!--     yy_union -->
+<!-- } -->
+
+<!-- ##' @rdname emapplot -->
+<!-- ##' @importFrom igraph E "E<-" -->
+<!-- ##' @importFrom ggplot2 aes_ -->
+<!-- ##' @importFrom ggplot2 guide_colorbar -->
+<!-- ##' @importFrom ggplot2 scale_size -->
+<!-- ##' @importFrom ggplot2 theme_void -->
+<!-- ##' @importFrom ggplot2 coord_equal -->
+<!-- ##' @importFrom ggplot2 labs -->
+<!-- ##' @importFrom ggraph ggraph -->
+<!-- ##' @importFrom ggraph geom_node_point -->
+<!-- ##' @importFrom ggraph geom_node_text -->
+<!-- ##' @importFrom ggraph geom_edge_link -->
+<!-- ##' @importFrom scatterpie geom_scatterpie -->
+<!-- ##' @importFrom scatterpie geom_scatterpie_legend -->
+<!-- ##' @importClassesFrom DOSE compareClusterResult -->
+<!-- ##' @param split separate result by 'category' variable -->
+<!-- ##' @param pie proportion of clusters in the pie chart, one of 'equal' (default) or 'Count' -->
+<!-- ##' @param legend_n number of circle in legend -->
+<!-- ##' @param pie_scale scale of pie chart or point, this parameter has been changed to "node_scale" -->
+<!-- ##' @param cex_line scale of line width -->
+<!-- ##' @param min_edge minimum percentage of overlap genes to display the edge, should between 0 and 1, default value is 0.2 -->
+<!-- ##' @importFrom stats setNames -->
+<!-- emapplot.compareClusterResult <- function(x, showCategory = 30, -->
+<!--                                           color = "p.adjust", layout = "nicely", -->
+<!--                                           split=NULL, pie = "equal", -->
+<!--                                           legend_n = 5, cex_category = NULL, -->
+<!--                                           pie_scale = NULL, cex_line = 1, -->
+<!--                                           min_edge=0.2, cex_label_category  = 1, -->
+<!--                                           node_label_size = NULL) { -->
+<!--     has_pairsim(x) -->
+<!--     if (!is.null(node_label_size)) -->
+<!--         message("node_label_size parameter has been changed to 'cex_label_category'") -->
+<!--     # if (is.null(cex_label_category)) { -->
+<!--         # if (!is.null(node_label_size)) { -->
+<!--             # cex_label_category <- node_label_size -->
+<!--         # } else { -->
+<!--             # cex_label_category <- 3 -->
+<!--         # } -->
+<!--     # } -->
+
+<!--     if (!is.null(pie_scale)) -->
+<!--         message("pie_scale parameter has been changed to 'cex_category'") -->
+
+<!--     if (is.null(cex_category)) { -->
+<!--         if (!is.null(pie_scale)) { -->
+<!--             cex_category <- pie_scale -->
+<!--         } else { -->
+<!--             cex_category <- 1 -->
+<!--         } -->
+<!--     } -->
+
+<!--     label_category <- 3 -->
+<!--     ## pretreatment of x, just like dotplot do -->
+<!--     y <- fortify(x, showCategory=showCategory, -->
+<!--                                       includeAll=TRUE, split=split) -->
+<!--     y$Cluster <- sub("\n.*", "", y$Cluster) -->
+<!--     ## geneSets <- geneInCategory(x) ## use core gene for gsea result -->
+
+<!--     ## Data structure transformation, combining the same ID (Description) genes -->
+<!--     y_union <- get_y_union(y = y, showCategory = showCategory) -->
+<!--     y <- y[y$ID %in% y_union$ID, ] -->
+
+<!--     geneSets <- setNames(strsplit(as.character(y_union$geneID), "/", -->
+<!--                                   fixed = TRUE), y_union$ID) -->
+
+<!--     g <- emap_graph_build(y=y_union,geneSets=geneSets,color=color, -->
+<!--                           cex_line=cex_line, min_edge=min_edge, -->
+<!--                           pair_sim = x@termsim, method = x@method) -->
+
+<!--     p <- get_p(y = y, g = g, y_union = y_union, cex_category = cex_category, -->
+<!--                pie = pie, layout = layout) -->
+<!--     if (is.null(dim(y)) | nrow(y) == 1 | is.null(dim(y_union)) | nrow(y_union) == 1) -->
+<!--         return(p) -->
+
+
+<!--     p <- ggraph(g, layout=layout) -->
+<!--     if (length(E(g)$width) > 0) { -->
+<!--         p <- p + geom_edge_link(alpha=.5, aes_(width=~I(width)), -->
+<!--                                 colour='grey') -->
+<!--     } -->
+
+<!--     ## then add the pie plot -->
+<!--     ## Get the matrix data for the pie plot -->
+<!--     ID_Cluster_mat <- prepare_pie_category(y,pie=pie) -->
+
+
+<!--     # plot the edge -->
+<!--     # get the X-coordinate and y-coordinate of pies -->
+<!--     aa <- p$data -->
+
+<!--     desc <- y_union$Description[match(rownames(ID_Cluster_mat), -->
+<!--                                       y_union$Description)] -->
+<!--     i <- match(desc, aa$name) -->
+
+<!--     ID_Cluster_mat$x <- aa$x[i] -->
+<!--     ID_Cluster_mat$y <- aa$y[i] -->
+
+<!--     #Change the radius value to fit the pie plot -->
+<!--     radius <- NULL -->
+<!--     ID_Cluster_mat$radius <- sqrt(aa$size[i] / sum(aa$size) * cex_category) -->
+<!--     #ID_Cluster_mat$radius <- sqrt(aa$size / pi) -->
+
+<!--     x_loc1 <- min(ID_Cluster_mat$x) -->
+<!--     y_loc1 <- min(ID_Cluster_mat$y) -->
+<!--     ## x_loc2 <- min(ID_Cluster_mat$x) -->
+<!--     ## y_loc2 <- min(ID_Cluster_mat$y)+0.1*(max(ID_Cluster_mat$y)-min(ID_Cluster_mat$y)) -->
+<!--     if(ncol(ID_Cluster_mat) > 4) { -->
+<!--         p <- p + geom_scatterpie(aes_(x=~x,y=~y,r=~radius), data=ID_Cluster_mat, -->
+<!--             cols=colnames(ID_Cluster_mat)[1:(ncol(ID_Cluster_mat)-3)],color=NA) + -->
+<!--             coord_equal() -->
+<!--         if (utils::packageVersion("ggrepel") >= "0.9.0") { -->
+<!--             p <- p + geom_node_text(aes_(label=~name), repel=TRUE, -->
+<!--                 size = label_category * cex_label_category, bg.color = "white") -->
+<!--         } else { -->
+<!--             p <- p + geom_node_text(aes_(label=~name), repel=TRUE, -->
+<!--                 size = label_category * cex_label_category) -->
+<!--         } -->
+<!--         p <- p + theme_void() + -->
+<!--             geom_scatterpie_legend(ID_Cluster_mat$radius, x=x_loc1, y=y_loc1, -->
+<!--                 n = legend_n, -->
+<!--                 labeller=function(x) round(sum(aa$size) * x^2 / cex_category)) + -->
+<!--             labs(fill = "Cluster") -->
+<!--         return(p) -->
+<!--     } -->
+<!--     ## annotate("text", label = "gene number", x = x_loc2, y = y_loc2, size = 4, colour = "red") -->
+<!--     title <- colnames(ID_Cluster_mat)[1] -->
+<!--     p + geom_node_point(aes_(color=~color, size=~size)) -->
+<!--     if (utils::packageVersion("ggrepel") >= "0.9.0") { -->
+<!--         p <- p + geom_node_text(aes_(label=~name), repel=TRUE, -->
+<!--             size = label_category * cex_label_category, bg.color = "white") -->
+<!--     } else { -->
+<!--         p <- p + geom_node_text(aes_(label=~name), repel=TRUE, -->
+<!--             size = label_category * cex_label_category) -->
+<!--     } -->
+<!--     p + theme_void() + -->
+<!--         scale_color_continuous(low="red", high="blue", name = color, -->
+<!--                                guide=guide_colorbar(reverse=TRUE)) + -->
+<!--         scale_size(range=c(3, 8) * cex_category)  +labs(title= title) -->
+<!-- } -->
+
+<!-- ##' Get the an ggraph object -->
+<!-- ##' -->
+<!-- ##' @importFrom ggplot2 ylim -->
+<!-- ##' @param y a data.frame -->
+<!-- ##' @param g an igraph object -->
+<!-- ##' @param y_union a data.frame -->
+<!-- ##' @param cex_category scale of pie plot -->
+<!-- ##' @param pie proportion of clusters in the pie chart, one of 'equal' (default) or 'Count' -->
+<!-- ##' @param layout layout of the map -->
+<!-- ##' @noRd -->
+<!-- get_p <- function(y, g, y_union, cex_category, pie, layout){ -->
+<!--     ## when y just have one line -->
+<!--     if(is.null(dim(y)) | nrow(y) == 1) { -->
+<!--         title <- y$Cluster -->
+<!--         p <- ggraph(g) + geom_node_point(color="red", size=5 * cex_category) + -->
+<!--             geom_node_text(aes_(label=~name)) + theme_void() + -->
+<!--             labs(title=title) -->
+<!--         return(p) -->
+<!--     } -->
+
+<!--     if(is.null(dim(y_union)) | nrow(y_union) == 1) { -->
+<!--         ##return(ggraph(g) + geom_node_point(color="red", size=5) + geom_node_text(aes_(label=~name))) -->
+<!--         p <- ggraph(g) -->
+<!--         ID_Cluster_mat <- prepare_pie_category(y, pie=pie) -->
+
+<!--         ID_Cluster_mat <- cbind(ID_Cluster_mat,1,1,0.1*cex_category) -->
+<!--         colnames(ID_Cluster_mat) <- c(colnames(ID_Cluster_mat)[1:(ncol(ID_Cluster_mat)-3)], -->
+<!--             "x", "y", "radius") -->
+
+
+<!--         p <- p + geom_scatterpie(aes_(x=~x,y=~y,r=~radius), data=ID_Cluster_mat, -->
+<!--                 cols=names(ID_Cluster_mat)[1:(ncol(ID_Cluster_mat)-3)], -->
+<!--                 color=NA)+ -->
+<!--             xlim(-3,3) + ylim(-3,3) + coord_equal()+ -->
+<!--             geom_node_text(aes_(label=~name), repel=TRUE) + -->
+<!--             theme_void()+labs(fill = "Cluster") -->
+<!--         return(p) -->
+
+<!--     } -->
+<!--     ggraph(g, layout=layout) -->
+<!-- } -->
+
+
+<!-- get_y_union <- function(y, showCategory){ -->
+<!--     y_union <- merge_compareClusterResult(y) -->
+
+<!--     n <- update_n(y_union, showCategory) -->
+<!--     if (is.numeric(n)) { -->
+<!--         y_union <- y_union[1:n,] -->
+<!--     } else { -->
+<!--         y_union <- y_union[match(n, y_union$Description),] -->
+<!--         n <- length(n) -->
+<!--     } -->
+<!--      if (n == 0) { -->
+<!--         stop("no enriched term found...") -->
+<!--     } -->
+
+<!--    return(y_union) -->
+<!-- } -->
+
+
+<!--   ego <- enrichplot::pairwise_termsim(ego) -->
+<!--   p1 <- emapplot.enrichResult(ego, cex_label_category = 0.75) -->
+<!-- # svg("emapplot_HKCCvsCC.svg", width = 10, height = 10) -->
+<!--  p1 -->
+<!-- # dev.off() -->
+<!-- ``` -->
+
+
+### Common TFs between Live v dead CC and CL075 v ctrl
+
+<!-- ```{r} -->
+
+<!-- load("BulkRNA_CountAnalysis.RData") -->
+<!-- HKvCC_DE_tab <- tr.HKCCvsCC$table -->
+<!-- .rowNamesDF(HKvCC_DE_tab, make.names = T) <- tr.HKCCvsCC$genes$Symbol -->
+<!-- HKvCC_DE_tab_ord <- HKvCC_DE_tab[order(HKvCC_DE_tab$PValue),] -->
+<!-- write.csv(HKvCC_DE_tab_ord, "HKvCC_DE_tab_ord.csv", row.names = T, quote = F) -->
+
+<!-- CL075vctrl_DE_tab <- tr.CL075vsctrl$table -->
+<!-- .rowNamesDF(CL075vctrl_DE_tab, make.names = T) <- tr.CL075vsctrl$genes$Symbol -->
+<!-- CL075vctrl_DE_tab_ord <- CL075vctrl_DE_tab[order(CL075vctrl_DE_tab$PValue),] -->
+<!-- write.csv(CL075vctrl_DE_tab_ord, "CL075vctrl_DE_tab_ord.csv", row.names = T, quote = F) -->
+
+<!-- my_chea3 <- function(tr.object, name) -->
+<!-- { -->
+<!--   DE_tab <- tr.object$table #%>%  -->
+<!--     #filter(logFC > 1) -->
+<!--   .rowNamesDF(DE_tab, make.names = T) <- tr.object$genes$Symbol -->
+<!--   DE_tab_ord <- DE_tab[order(DE_tab$PValue),] -->
+
+<!--   #Add genes to Input_Genes list -->
+<!--   genes <- DE_tab_ord %>% -->
+<!--     mutate(FDR = p.adjust(PValue, method = "BH")) %>%  -->
+<!--     filter(FDR <= 0.05 & abs(logFC) > 2) %>%  -->
+<!--     rownames(.) -->
+<!--   #rownames(DE_tab_ord)[1:200] -->
+
+<!--   # Assign variables for ChEA3 -->
+<!--   url = "https://amp.pharm.mssm.edu/chea3/api/enrich/" -->
+<!--   encode = "json" -->
+<!--   payload = list(query_name = name, gene_set = genes) -->
+
+<!--   #POST to ChEA3 server -->
+<!--   response = POST(url = url, body = payload, encode = encode) -->
+<!--   json = content(response) -->
+
+<!--   #select mean rank table from results  -->
+<!--   results = fromJSON(json) -->
+
+<!--   mean_rank_tb <- results$`Integrated--meanRank` %>% as_tibble() -->
+<!--   mean_rank_tb[[paste(name)]] = as.numeric(mean_rank_tb$Score) -->
+<!--   mean_rank_tb[[paste(name, "rank", collapse = "_")]] = as.numeric(mean_rank_tb$Rank) -->
+<!--   mean_rank_clean = mean_rank_tb %>% -->
+<!--     select(TF,name, ends_with("rank")) %>% -->
+<!--     select(-Rank) -->
+
+<!--   return(mean_rank_clean) -->
+<!--   #return(results) -->
+<!-- } -->
+<!-- HKvCCmean_rank_clean <- my_chea3(tr.HKCCvsCC, "HKvCC") -->
+
+<!-- CL075vctrlmean_rank_clean <- my_chea3(tr.CL075vsctrl, "CL075vctrl") -->
+
+<!-- # arranged according to rank of first object -->
+<!-- combined_TFs <- inner_join(HKvCCmean_rank_clean[1:150,], CL075vctrlmean_rank_clean[1:150,]) %>%  -->
+<!--   column_to_rownames("TF") %>%  -->
+<!--   arrange("HKvsCC rank", "CL075vsctrl rank") -->
+<!-- mat = combined_TFs[1:50, c("HKvCC rank", "CL075vctrl rank")] -->
+<!-- p <- Heatmap(mat,  -->
+<!--              col = viridis_pal(option = "B")(8), -->
+<!--         rect_gp = gpar(col = "white", lwd = 0.5), -->
+<!--         width = ncol(mat)*unit(7, "mm"),  -->
+<!--         height = nrow(mat)*unit(1.7, "mm"), -->
+<!--         name = "TFEA rank", -->
+<!--         heatmap_legend_param = list(legend_gp = gpar(fontsize = 5)), -->
+<!--         cluster_rows = T, cluster_columns = F, -->
+<!--         show_row_dend = T, show_row_names = T, -->
+<!--         column_title = "Enriched TF rank", -->
+<!--         column_title_gp = gpar(fontsize = 12), -->
+<!--         column_names_gp = gpar(fontsize = 8), -->
+<!--         column_names_rot = 45, -->
+<!--         row_names_gp = gpar(fontsize = 5)) -->
+<!-- draw(p) -->
+
+<!-- # svg("commonTF_HKvCC_CL075vCtrl_thresholds.svg") -->
+<!-- # draw(p) -->
+<!-- # dev.off() -->
+
+<!-- ``` -->
+
+```{r}
+knitr::include_graphics("commonTF_HKvCC_CL075vCtrl_thresholds.pdf")
+```
+
+<!-- ### TF - target gene network -->
+<!-- ```{r, out.width="0.3\\linewidth", include=TRUE, fig.align="center", echo=FALSE} -->
+<!-- knitr::include_graphics("NW_18_0.2_shortened_groupcircle.pdf") -->
+<!-- ``` -->

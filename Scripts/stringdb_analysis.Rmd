@@ -1,0 +1,130 @@
+---
+title: "Human monocyte liveCC vs deadCC"
+output:
+  
+  html_document:
+    pdf_document:
+    keep_md: true
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+  pdf_document:
+    
+    keep_md: true
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: kable
+always_allow_html: true
+header-includes:
+  - \hypersetup{colorlinks=true, linkcolor=blue}
+---
+
+
+```{r setup, include=FALSE}
+httr::set_config(httr::config(ssl_verifypeer = FALSE))
+knitr::opts_chunk$set(warning = F, message = F, fig.dim = c(10,8))
+```
+# Packages
+```{r packages, warning=FALSE, message=FALSE}
+# BiocManager::install("edgeR")
+# BiocManager::install("GO.db")
+# BiocManager::install("org.Hs.eg.db")
+# install.packages("remotes")
+# remotes::install_github("jmw86069/multienrichjam",dependencies=TRUE);
+# BiocManager::install("pathview")
+library(edgeR)
+library(tidyverse)
+library(ggplot2)
+library(ggrepel)
+library(GO.db)
+library(org.Hs.eg.db)
+library(biomaRt)
+library(pheatmap)
+library(RColorBrewer)
+library(ComplexHeatmap)
+library(wesanderson)
+library(topGO)
+library(EnsDb.Hsapiens.v79)
+library(statmod)
+library(patchwork)
+library(multienrichjam)
+library(enrichplot)
+library(DOSE)
+library(clusterProfiler)
+library(GOSemSim)
+library(ggupset)
+#library(pathview)
+```
+
+```{r}
+# liveCC vs deadCC
+# REACTOME
+
+HKCC_CC_enrichment.RCTM <- read.delim("CC_vs_HKCC_stringdb/enrichment.RCTM.tsv") %>% 
+  mutate(percent_genes_found = 100*observed.gene.count / background.gene.count)
+
+ggplot(HKCC_CC_enrichment.RCTM, aes(x = strength, y = term.description, colour = -log10(false.discovery.rate))) +
+  geom_point(aes(size = percent_genes_found)) +
+  scale_colour_continuous(name = "-log10(FDR)") +
+  labs(size = "Obs/Bg genes %") +
+  xlab("Log10(Observed/Expected)") +
+  theme_bw()
+
+```
+
+```{r}
+# CL075 vs ctrl
+# REACTOME
+
+CL075_ctrl_enrichment.RCTM <- read.delim("CL075_vs_ctrl_stringdb/enrichment.RCTM.tsv") %>% 
+  mutate(percent_genes_found = 100*observed.gene.count / background.gene.count)
+
+ggplot(CL075_ctrl_enrichment.RCTM, aes(x = strength, y = term.description, colour = -log10(false.discovery.rate))) +
+  geom_point(aes(size = percent_genes_found)) +
+  scale_colour_continuous(name = "-log10(FDR)") +
+  labs(size = "Obs/Bg genes %") +
+  xlab("Log10(Observed/Expected)") +
+  theme_bw()
+
+```
+
+```{r}
+intersect.pathways <- intersect(HKCC_CC_enrichment.RCTM$term.description, CL075_ctrl_enrichment.RCTM$term.description)
+
+HKCC_CC_enrichment.RCTM <- HKCC_CC_enrichment.RCTM %>% 
+  mutate(Comparison.l1 = "HKCC_vs_CC") %>% 
+  dplyr::select(-c(X.term.ID, observed.gene.count, background.gene.count, matching.proteins.in.your.network..IDs.))
+
+CL075_ctrl_enrichment.RCTM <- CL075_ctrl_enrichment.RCTM %>% 
+  mutate(Comparison.l1 = "CL075_vs_ctrl") %>% 
+  dplyr::select(-c(X.term.ID, observed.gene.count, background.gene.count, matching.proteins.in.your.network..IDs.))
+
+all.RCTM <- CL075_ctrl_enrichment.RCTM %>% 
+  full_join(., HKCC_CC_enrichment.RCTM) %>% 
+  mutate(Comparison.l2 = case_when(
+    term.description %in% intersect.pathways ~ "Common",
+    .default = Comparison.l1
+  ))
+
+p <- ggplot(all.RCTM, aes(x = strength, y = term.description, colour = -log10(false.discovery.rate), shape = factor(Comparison.l1))) +
+  geom_point(aes(size = percent_genes_found)) +
+  scale_colour_continuous(name = "-log10(FDR)", type = "viridis") +
+  labs(size = "Obs/Bg genes %") +
+  xlab("Log10(Observed/Expected)") +
+  ylab("Reactome pathway") +
+  facet_wrap(. ~ factor(Comparison.l2, levels = c("HKCC_vs_CC", "Common", "CL075_vs_ctrl")), ncol = 1,scales = "free_y") +
+  theme_bw() +
+  xlim(c(0,2.25)) +
+  theme(strip.background =element_rect(fill="aliceblue", colour = "white"),
+            strip.text.x = element_text(size = 11))
+
+svg("RCTM1.svg")
+p
+dev.off()
+
+p1 <- all.RCTM %>% 
+  filter(Comparison.l2 == "HKCC_vs_CC") %>% 
+  ggplot()
+```

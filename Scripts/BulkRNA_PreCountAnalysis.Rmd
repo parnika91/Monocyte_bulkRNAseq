@@ -1,0 +1,99 @@
+---
+title: "Bulk RNA-seq - Mapping quality"
+output:
+  
+  pdf_document:
+    
+    keep_md: true
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: kable
+  html_document:
+    pdf_document:
+    keep_md: true
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+always_allow_html: true
+header-includes:
+  - \hypersetup{colorlinks=true, linkcolor=blue}
+---
+
+```{r setup, include=FALSE}
+httr::set_config(httr::config(ssl_verifypeer = FALSE))
+knitr::opts_chunk$set(warning = F, message = F, fig.dim = c(10,8))
+```
+# Packages
+```{r packages, warning=FALSE, message=FALSE}
+# BiocManager::install("edgeR")
+# BiocManager::install("GO.db")
+# BiocManager::install("org.Hs.eg.db")
+# install.packages("remotes")
+# remotes::install_github("jmw86069/multienrichjam",dependencies=TRUE);
+# BiocManager::install("pathview")
+library(edgeR)
+library(tidyverse)
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+library(RColorBrewer)
+library(ComplexHeatmap)
+library(wesanderson)
+library(statmod)
+library(patchwork)
+library(ggupset)
+require(readr)  # for read_csv()
+require(dplyr)  # for mutate()
+require(tidyr)  # for unnest()
+require(purrr)
+library(reshape2)
+library(viridisLite)
+```
+
+
+```{r get_sample_names}
+sampleTable <- read.csv("../Data/samplelist.csv", header = F)
+
+```
+
+```{r get_info_from_each_log_file}
+dir_bam <- "../Results/bam/"
+
+files <- list()
+for(i in 1:nrow(sampleTable))
+{
+  inlist <- strsplit(readLines(paste0(dir_bam, sampleTable[i,1], "Log.final.out", collapse = "")), "\t")
+  files[[sampleTable[i,1]]] <- lapply(inlist, tail, n = -1)
+  names(files[[sampleTable[i,1]]]) <- lapply(inlist, head, n = 1)
+}
+
+df <- as.data.frame(do.call(rbind, files))
+colnames(df) <- str_trim(colnames(df)) %>% 
+  strsplit(split = "\\|")
+
+df_plot <- df %>% 
+  select(`Uniquely mapped reads % `,
+         `% of reads mapped to multiple loci `,
+         `% of reads unmapped: too short `) %>% 
+  rownames_to_column("sample")
+
+df_plot[] <- lapply(df_plot, gsub, pattern='%', replacement='')
+
+p <- df_plot %>% 
+  melt(id.vars = "sample") %>% 
+  mutate(value = as.numeric(value)) %>% 
+  ggplot(aes(sample, value, fill = variable)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_viridis_d(option="viridis") +
+  theme_light() +
+  labs(fill = "Categories", y = "Percentage of reads", x = "Sample") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  theme(text = element_text(size = 14)) +
+  ggtitle("Read mapping quality")
+ggsave(plot = p, file = "Read mapping quality.pdf")
+
+```
+
+

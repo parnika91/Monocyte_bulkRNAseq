@@ -1,0 +1,389 @@
+---
+title: "Bulk RNA-seq data analysis"
+output:
+  
+  html_document:
+    pdf_document:
+    keep_md: true
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+  pdf_document:
+    
+    keep_md: true
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: kable
+always_allow_html: true
+header-includes:
+  - \hypersetup{colorlinks=true, linkcolor=blue}
+---
+
+```{r setup, include=FALSE}
+httr::set_config(httr::config(ssl_verifypeer = FALSE))
+knitr::opts_chunk$set(warning = F, message = F, fig.dim = c(10,8))
+```
+# Packages
+```{r packages, warning=FALSE, message=FALSE}
+# BiocManager::install("edgeR")
+# BiocManager::install("GO.db")
+# BiocManager::install("org.Hs.eg.db")
+# install.packages("remotes")
+# remotes::install_github("jmw86069/multienrichjam",dependencies=TRUE);
+# BiocManager::install("pathview")
+library(edgeR)
+library(tidyverse)
+library(ggplot2)
+library(ggrepel)
+library(GO.db)
+library(org.Hs.eg.db)
+library(biomaRt)
+library(pheatmap)
+library(RColorBrewer)
+library(ComplexHeatmap)
+library(wesanderson)
+library(topGO)
+library(EnsDb.Hsapiens.v79)
+library(statmod)
+library(patchwork)
+library(multienrichjam)
+library(enrichplot)
+library(DOSE)
+library(clusterProfiler)
+library(GOSemSim)
+library(ggupset)
+library(pathview)
+```
+
+# Load data
+```{r load_data}
+load("BulkRNA_CountAnalysis.RData")
+```
+
+# Gene Ontology term enrichment analysis
+```{r topGO}
+
+Bioconductor<-ViSEAGO::Bioconductor2GO()
+myGENE2GO<-ViSEAGO::annotate(
+     "org.Hs.eg.db",
+     Bioconductor
+  )
+
+my_topGO <- function(dgelrt)
+{
+  dgelrt$table$FDR <- p.adjust(dgelrt$table$PValue, method = "BH")
+  
+  geneIDs <- biomaRt::select(org.Hs.eg.db, 
+       keys = rownames(dgelrt),
+       columns = c("ENTREZID", "ENSEMBL"),
+       keytype = "ENSEMBL")
+
+  dgelrt$genes <- dgelrt$genes %>% 
+    rownames_to_column("ENSEMBL") %>% 
+    left_join(., geneIDs)
+  
+  uni_entrez <- dgelrt$genes$ENTREZID
+  sel_entrez <- dgelrt$table %>% 
+    dplyr::filter(FDR <= 0.01) %>%
+    rownames_to_column("ENSEMBL") %>% 
+    left_join(., dgelrt$genes) %>% 
+    pull(ENTREZID)
+
+  # For topGO:
+  # uni <- rownames(dgelrt)
+  # sel <- dgelrt$table %>% 
+  #   dplyr::filter(FDR <= 0.01) %>% 
+  #   rownames_to_column("ENSEMBL") %>% 
+  #   pull(ENSEMBL)
+  # geneList <- factor(as.integer(uni %in% sel))
+  # names(geneList) <- uni
+  # 
+  # topDiffGenes <- function(allScore)
+  # {
+  #   return(allScore == 1)
+  # }
+  # x <- topDiffGenes(geneList)
+  # 
+  # # sometimes needs a restart of the session to work
+  # hGOdata <- new("topGOdata",
+  #                ontology = "BP",
+  #                allGenes = geneList,
+  #                nodeSize = 10,
+  #                annotationFun = annFUN.org,
+  #                geneSelectionFun = topDiffGenes,
+  #                mapping = "org.Hs.eg.db",
+  #                ID = "ensembl")
+  # # Error in switch(type, isa = 0, partof = 1, -1) : 
+  # # EXPR must be a length 1 vector
+  # 
+  # resultKS=runTest(hGOdata, algorithm='weight01', statistic='Fisher')
+  # allGO=usedGO(hGOdata)
+  # all_res=GenTable(hGOdata, Fisher=resultKS, orderBy="Fisher", topNodes=length(allGO), numChar = 1000)
+  # 
+  # GenesForGOterm <- c()
+  # myterms = all_res$GO.ID
+  # mygenes <- genesInTerm(hGOdata, myterms)
+  # for (i in 1:length(myterms))
+  # {
+  #   myterm <- mygenes[myterms[i]][[1]]
+  #   mygenesforterm <- myterm[which(myterm %in% sel == TRUE)]
+  #   if(!is_empty(mygenesforterm))
+  #   {
+  #     geneIDs <- ensembldb::select(EnsDb.Hsapiens.v79,
+  #                                keys = mygenesforterm,
+  #                                keytype = "GENEID",
+  #                                columns = c("SYMBOL","GENEID"))
+  #     mygenesforterm <- paste(geneIDs$SYMBOL, collapse=", ")
+  #   }else{
+  #     mygenesforterm <- ""
+  #   }
+  #   GenesForGOterm[i] <- mygenesforterm
+  # }
+  # 
+  # all_res$GenesForGOterm <- GenesForGOterm
+  # write.table(all_res, paste0(comparison, "_GOenr.csv"), sep = '\t', row.names = F)
+  
+  ### ViSEAGO
+  # Bioconductor default is entrez ID, so using Ensembl2GO
+  #ens<-ViSEAGO::Ensembl2GO(biomart = "genes")
+
+  # load GO annotations from Bioconductor
+  # myGENE2GO_ens<-ViSEAGO::annotate(
+  #     id = "hsapiens_gene_ensembl",
+  #     object = ens
+  # )
+  
+  viseago<-ViSEAGO::create_topGOdata(
+      geneSel=sel_entrez,
+      allGenes=uni_entrez,
+    #geneList = geneList,
+      gene2GO=myGENE2GO, 
+      ont="BP",
+      nodeSize=5
+  )
+  
+  viseago_res<-topGO::runTest(
+      viseago,
+      algorithm ="weight01",
+      statistic = "fisher",
+      cutOff=0.01
+  )
+  
+  go <- list(viseago=viseago, viseago_res=viseago_res)
+  return(go)
+}
+
+CL075vsCC_topGO <- my_topGO(tr.CL075vsCC)
+HKCCvsCC_topGO <- my_topGO(tr.HKCCvsCC)
+# CCvsctrl_topGO <- my_topGO(tr.CCvsctrl)
+# HKCCvsctrl_topGO <- my_topGO(tr.HKCCvsctrl)
+# CL075vsctrl_topGO <- my_topGO(tr.CL075vsctrl)
+
+CL075_CC_viseago <- CL075vsCC_topGO$viseago
+CL075_CC_viseago_res <- CL075vsCC_topGO$viseago_res
+
+HKCC_CC_viseago <- HKCCvsCC_topGO$viseago
+HKCC_CC_viseago_res <- HKCCvsCC_topGO$viseago_res
+
+# CL075_ctrl_viseago <- CL075vsctrl_topGO$viseago
+# CL075_ctrl_viseago_res <- CL075vsctrl_topGO$viseago_res
+# 
+# HKCC_ctrl_viseago <- HKCCvsctrl_topGO$viseago
+# HKCC_ctrl_viseago_res <- HKCCvsctrl_topGO$viseago_res
+# 
+# CC_ctrl_viseago <- CCvsctrl_topGO$viseago
+# CC_ctrl_viseago_res <- CCvsctrl_topGO$viseago_res
+
+# # merge topGO results
+sResults<-ViSEAGO::merge_enrich_terms(
+    cutoff=0.01,
+    Input=list(
+        CL075vsCC=c(
+            "CL075_CC_viseago",
+            "CL075_CC_viseago_res"
+        ),
+        HKCCvsCC=c(
+            "HKCC_CC_viseago",
+            "HKCC_CC_viseago_res"
+        # ),
+        # CL075vsctrl=c(
+        #     "CL075_ctrl_viseago",
+        #     "CL075_ctrl_viseago_res"
+        # ),
+        # HKCCvsctrl=c(
+        #     "HKCC_ctrl_viseago",
+        #     "HKCC_ctrl_viseago_res"
+        # ),
+        # CCvsctrl=c(
+        #     "CC_ctrl_viseago",
+        #     "CC_ctrl_viseago_res"
+         )
+    )
+)
+
+```
+## GO enrichment across groups
+```{r ViSEAGO}
+
+#ViSEAGO::GOcount(sResults)
+
+# display intersections
+ViSEAGO::Upset(
+    sResults,
+    file="../Results/count_analysis/upset.xls"
+)
+
+# create GO_SS-class object
+myGOs<-ViSEAGO::build_GO_SS(
+    gene2GO=myGENE2GO,
+    enrich_GO_terms=sResults
+)
+
+
+# compute Semantic Similarity (SS)
+myGOs<-ViSEAGO::compute_SS_distances(
+    myGOs,
+    distance="Wang"
+)
+
+# MDSplot
+ViSEAGO::MDSplot(myGOs)
+
+# Create GOterms heatmap
+Wang_clusters_wardD2<-ViSEAGO::GOterms_heatmap(
+    myGOs,
+    showIC=FALSE,
+    showGOlabels =FALSE,
+    GO.tree=list(
+        tree=list(
+            distance="Wang",
+            aggreg.method="ward.D2"
+        ),
+        cut=list(
+            dynamic=list(
+                pamStage=TRUE,
+                pamRespectsDendro=TRUE,
+                deepSplit=2,
+                minClusterSize =2
+            )
+        )
+    ),
+    samples.tree=NULL
+)
+
+# display the heatmap
+ViSEAGO::show_heatmap(
+    Wang_clusters_wardD2,
+    "GOterms"
+)
+
+#calculate semantic similarites between clusters of GO terms
+Wang_clusters_wardD2<-ViSEAGO::compute_SS_distances(
+    Wang_clusters_wardD2,
+    distance="BMA"
+)
+
+
+# MDSplot
+ViSEAGO::MDSplot(
+    Wang_clusters_wardD2,
+    "GOclusters"
+)
+
+# GOclusters heatmap
+Wang_clusters_wardD2<-ViSEAGO::GOclusters_heatmap(
+    Wang_clusters_wardD2,
+    tree=list(
+        distance="BMA",
+        aggreg.method="ward.D2"
+    )
+)
+
+
+# display the heatmap
+# ViSEAGO::show_heatmap(
+#     Wang_clusters_wardD2,
+#     "GOclusters"
+# )
+```
+
+
+
+# Pathway analysis with KEGG
+```{r pathway}
+path <- function(dgelrt, comparison)
+{
+  geneIDs <- biomaRt::select(org.Hs.eg.db, 
+       keys = rownames(dgelrt),
+       columns = c("ENTREZID", "ENSEMBL"),
+       keytype = "ENSEMBL")
+
+  dgelrt$genes <- dgelrt$genes %>% 
+    rownames_to_column("ENSEMBL") %>% 
+    left_join(., geneIDs)
+  
+  geneList <- dgelrt$table %>% 
+    rownames_to_column("ENSEMBL") %>% 
+    left_join(., dgelrt$genes) %>% 
+    dplyr::select(ENTREZID, logFC) %>% 
+    arrange(desc(logFC)) %>% 
+    deframe()
+    
+  gene <- names(geneList)[abs(geneList) > 2]
+  
+  kk <- enrichKEGG(gene         = gene,
+                 organism     = 'hsa',
+                 pvalueCutoff = 0.05
+                 )
+  y <- setReadable(kk, OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+  print(head(y))
+  print(dotplot(kk, showCategory = 10, title = paste(comparison, " KEGG enrichment")))
+  
+  kk2 <- gseKEGG(geneList     = geneList,
+                 organism     = 'hsa',
+                 minGSSize    = 120,
+                 pvalueCutoff = 0.05,
+                 verbose      = FALSE)
+  y2 <- setReadable(kk2, OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+  print(head(y2))
+  print(dotplot(kk2, showCategory = 10, title = paste(comparison, " KEGG GSEA")))
+  
+  write.csv(y@result, paste("../Results/count_analysis/", comparison, " KEGG enr.csv"), row.names = F, quote = F)
+  write.csv(y2@result, paste("../Results/count_analysis/", comparison, " KEGG GSEA.csv"), row.names = F, quote = F)
+}
+
+path(tr.CL075vsctrl, "CL075vsctrl")
+path(tr.HKCCvsCC, "HKCCvsCC")
+```
+
+```{r specific_pathways}
+
+dgelrt <- tr.CL075vsCC
+geneIDs <- biomaRt::select(org.Hs.eg.db, 
+       keys = rownames(dgelrt),
+       columns = c("ENTREZID", "ENSEMBL"),
+       keytype = "ENSEMBL")
+
+  dgelrt$genes <- dgelrt$genes %>% 
+    rownames_to_column("ENSEMBL") %>% 
+    left_join(., geneIDs)
+  
+  geneList <- dgelrt$table %>% 
+    rownames_to_column("ENSEMBL") %>% 
+    left_join(., dgelrt$genes) %>% 
+    dplyr::select(ENTREZID, logFC) %>% 
+    arrange(desc(logFC)) %>% 
+    deframe()
+
+hsa04060 <- pathview(gene.data  = geneList,
+                     pathway.id = "hsa04060",
+                     species    = "hsa",
+                     limit      = list(gene=max(abs(geneList)), cpd=1),
+                     low = list(gene = "yellow", cpd = "purple"), 
+                     mid = list(gene = "gray", cpd = "gray"), 
+                     high = list(gene = "blue", cpd = "orange"),
+                     kegg.native = F, match.data = F, multi.state = T, same.layer = T)
+knitr::include_graphics("hsa04060.pathview.pdf")
+```

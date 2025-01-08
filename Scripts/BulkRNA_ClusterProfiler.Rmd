@@ -1,0 +1,164 @@
+---
+title: "Bulk RNA-seq data analysis"
+output:
+  
+  pdf_document:
+    
+    keep_md: true
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: kable
+  html_document:
+    pdf_document:
+    keep_md: true
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+always_allow_html: true
+header-includes:
+  - \hypersetup{colorlinks=true, linkcolor=blue}
+---
+
+```{r setup, include=FALSE}
+httr::set_config(httr::config(ssl_verifypeer = FALSE))
+knitr::opts_chunk$set(warning = F, message = F, fig.dim = c(10,8))
+```
+# Packages
+```{r packages, warning=FALSE, message=FALSE}
+# BiocManager::install("edgeR")
+# BiocManager::install("GO.db")
+# BiocManager::install("org.Hs.eg.db")
+# install.packages("remotes")
+# remotes::install_github("jmw86069/multienrichjam",dependencies=TRUE);
+# BiocManager::install("pathview")
+library(edgeR)
+library(tidyverse)
+library(ggplot2)
+library(ggrepel)
+library(GO.db)
+library(org.Hs.eg.db)
+library(biomaRt)
+library(pheatmap)
+library(RColorBrewer)
+library(ComplexHeatmap)
+library(wesanderson)
+library(topGO)
+library(EnsDb.Hsapiens.v79)
+library(statmod)
+library(patchwork)
+library(multienrichjam)
+library(enrichplot)
+library(DOSE)
+library(clusterProfiler)
+library(GOSemSim)
+library(ggupset)
+library(viridis)
+library(scales)# for show_col
+#library(pathview)
+```
+
+# Load data
+```{r load_data}
+load("BulkRNA_CountAnalysis.RData")
+```
+
+## Gene Ratio dotplots, Gene Set Enrichment analysis (GSEA)
+```{r clusterProfiler_GO}
+clustProf <- function(dgelrt, comparison)
+{
+  cat("  \n###", comparison, "  \n")
+  geneIDs <- biomaRt::select(org.Hs.eg.db, 
+       keys = rownames(dgelrt),
+       columns = c("ENTREZID", "ENSEMBL"),
+       keytype = "ENSEMBL")
+
+  dgelrt$genes <- dgelrt$genes %>% 
+    rownames_to_column("ENSEMBL") %>% 
+    left_join(., geneIDs)
+  
+  geneList <- dgelrt$table %>% 
+    rownames_to_column("ENSEMBL") %>% 
+    left_join(., dgelrt$genes) %>% 
+    dplyr::select(ENTREZID, logFC) %>% 
+    arrange(desc(logFC)) %>% 
+    deframe()
+    
+  gene <- names(geneList)[abs(geneList) > 2]
+  
+  ggo <- groupGO(gene     = gene,
+                 OrgDb    = org.Hs.eg.db,
+                 ont      = "BP",
+                 level    = 3,
+                 readable = TRUE)
+  
+  ego <- enrichGO(gene          = gene,
+                  universe      = names(geneList),
+                  OrgDb         = org.Hs.eg.db,
+                  ont           = "BP",
+                  pAdjustMethod = "BH",
+                  pvalueCutoff  = 0.01,
+                  qvalueCutoff  = 0.05,
+                  readable      = TRUE)
+  print(head(ego))
+  
+  ego2 <- gseGO(geneList     = geneList,
+                OrgDb        = org.Hs.eg.db,
+                ont          = "BP",
+                minGSSize    = 100,
+                maxGSSize    = 500,
+                pvalueCutoff = 0.05,
+                verbose      = FALSE
+                )
+  ego2_r <- setReadable(ego2, OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+  print(head(ego2_r))
+  
+  print(barplot(ego, showCategory=20, font.size = 7) )
+  # mutate(ego, qscore = -log(p.adjust, base=10)) %>% 
+  #     barplot(x="qscore", font.size = 7) %>%  print()
+  print(dotplot(ego, showCategory=30, font.size = 6) + ggtitle(paste("Over-representation analysis -", comparison)))
+  #print(dotplot(ego2, showCategory=30, font.size = 6) + ggtitle("dotplot for GSEA"))
+  
+  egox <- setReadable(ego, 'org.Hs.eg.db', 'ENTREZID')
+  p1 <- heatplot(egox, showCategory=5)
+  p2 <- heatplot(egox, foldChange=geneList, showCategory=10)
+  #print(cowplot::plot_grid(p1, p2, ncol=1, labels=LETTERS[1:2]))
+  print(p2)
+  svg("heatplot.svg")
+  print(p2)
+  dev.off()
+  
+  egox2 <- pairwise_termsim(egox)
+  p1 <- treeplot(egox2, fontsize = 2, title = paste(comparison, " - treeplot"), 
+                 showCategory = 30, label_format = 80, nWords = 0,
+                 group_colour = show_col(viridis_pal(option = "B")(5)))
+  #p2 <- treeplot(egox2, hclust_method = "average", fontsize = 2)
+  print(p1)
+  #print(p2)
+  
+  ego <- pairwise_termsim(ego)
+  p1 <- emapplot(ego, cex_label_category = 0.75)
+  # p2 <- emapplot(ego, cex_category=1.5, cex_label_category = 0.75)
+  # p3 <- emapplot(ego, layout="kk", cex_label_category = 0.75)
+  # p4 <- emapplot(ego, cex_category=1.5,layout="kk", cex_label_category = 0.75) 
+  #print(cowplot::plot_grid(p1, p2, p3, p4, ncol=2, labels=LETTERS[1:4]))
+  print(p1)
+  # print(p2)
+  # print(p3)
+  # print(p4)
+  print(upsetplot(ego, font.size = 7))
+  #print(ridgeplot(ego2, fontsize = 5.5) + labs(x = "enrichment distribution"))
+  
+  cat("  \n")
+  
+  write.csv(ego@result, paste("../Results/count_analysis/", comparison, " GO enr.csv"), row.names = F, quote = F)
+  write.csv(ego2_r@result, paste("../Results/count_analysis/", comparison, " GO GSEA.csv"), row.names = F, quote = F)
+}
+
+#clustProf(tr.CL075vsCC, "CL075 vs CC")
+clustProf(tr.HKCCvsCC, "HKCC vs CC")
+# clustProf(tr.CCvsctrl, "CC vs ctrl")
+# clustProf(tr.HKCCvsctrl, "HKCC vs ctrl")
+clustProf(tr.CL075vsctrl, "CL075 vs ctrl")
+```

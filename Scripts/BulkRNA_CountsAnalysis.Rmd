@@ -1,0 +1,722 @@
+---
+title: "Bulk RNA-seq data analysis"
+output:
+  
+  pdf_document:
+    keep_md: true
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: kable
+  html_document:
+    pdf_document:
+    keep_md: true
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+always_allow_html: true
+header-includes:
+  - \hypersetup{colorlinks=true, linkcolor=blue}
+---
+
+```{r setup, include=FALSE}
+httr::set_config(httr::config(ssl_verifypeer = FALSE))
+knitr::opts_chunk$set(warning = F, message = F)
+```
+
+# Packages
+```{r packages, warning=FALSE, message=FALSE}
+# BiocManager::install("edgeR")
+# BiocManager::install("GO.db")
+# BiocManager::install("org.Hs.eg.db")
+# install.packages("remotes")
+# remotes::install_github("jmw86069/multienrichjam",dependencies=TRUE);
+# BiocManager::install("pathview")
+library(edgeR)
+library(tidyverse)
+library(ggrepel)
+library(GO.db)
+library(org.Hs.eg.db)
+library(biomaRt)
+library(pheatmap)
+library(RColorBrewer)
+library(ComplexHeatmap)
+# check https://askubuntu.com/questions/1041349/imagemagick-command-line-convert-limit-values if Heatmap throws error
+library(wesanderson)
+library(topGO)
+library(EnsDb.Hsapiens.v79)
+library(statmod)
+library(patchwork)
+library(ggplot2)
+library(multienrichjam)
+library(enrichplot)
+library(DOSE)
+library(clusterProfiler)
+library(GOSemSim)
+library(ggupset)
+library(scales)
+library(readr)
+library(dplyr)
+library(tibble)
+library(magrittr)
+library(edgeR)
+library(ggplot2)
+#library(ggbio)
+library(biomaRt)
+library(stringr)
+library(reshape2)
+library(magrittr)
+library(ggrepel)
+library(limma)
+library(Glimma)
+library(pheatmap)
+library(GenomicRanges)
+library(GenomeInfoDb)
+#library(biovizBase)
+
+#library(pathview)
+```
+
+# Load data
+```{r load_data}
+data <- read.csv("../Results/gene_counts/P1255_genecounts.csv", row.names=1, sep=";")
+
+# clean the column names
+colnames(data) <- sapply(colnames(data), function(x) strsplit(x, split= "Aligned")[[1]][1])
+colnames(data) <- gsub("\\.", "_", colnames(data))
+colnames(data) <- gsub("X", "", colnames(data))
+```
+
+# Processing of data
+Includes filtering genes by expression, extracting protein-coding genes, getting gene symbols, normalisation, estimating dispersion and testing for diff expressed genes
+```{r DGEList}
+# assign groups to each column
+group = substr(colnames(data), 4, nchar(colnames(data)))
+# create DGEList
+y <- DGEList(counts = data, group = group)
+#remove .x from geneID
+rownames(y) <- sapply(rownames(y), 
+                                 function(x) strsplit(x, split = "\\.")[[1]][1])
+
+# filter genes without "worthwhile" counts in minimum two samples
+keep <- filterByExpr(y)
+
+# keep only protein coding genes
+ensembl <- useEnsembl("ensembl",dataset="hsapiens_gene_ensembl") #,host="https://uswest.ensembl.org"
+my.genes <- rownames(y)
+out <- getBM(attributes=c("ensembl_gene_id", "gene_biotype"), 
+    filters="ensembl_gene_id", values=my.genes, mart=ensembl)
+out <- out[match(my.genes, out$ensembl_gene_id),]
+
+
+keep <- keep & (out$gene_biotype=="protein_coding" & !is.na(out$gene_biotype))
+
+y <- y[keep, , keep.lib.sizes=FALSE]
+# #genes went down from 61857 to 12309!!
+
+# get gene smybols
+#VERY IMPORTANT: y$genes should be a data frame, otherwise glmQLFTest or glmTreat doesn't work
+y$genes <- data.frame(Symbol = mapIds(org.Hs.eg.db, rownames(y), keytype="ENSEMBL", column="SYMBOL"))
+
+
+### analysis after removing everything except protein coding genes
+
+# Normalisation
+#edgeR is concerned with differential expression analysis rather than 
+#with the quantification of expression levels
+
+#For example, read counts can generally be expected to be proportional to length as well as to
+#expression for any transcript, but edgeR does not generally need to adjust for gene length
+#because gene length has the same relative influence on the read counts for each RNA sample.
+#For this reason, normalization issues arise only to the extent that technical factors have
+#sample-specific effects.
+
+# calculate normalisation factors based on lib size
+y <- calcNormFactors(y)
+
+# design matrix
+design <- model.matrix(~0+group)
+# ~group: (Intercept)CC(1) groupCL075(2) groupctrl(3) groupHKCC(4)
+# ~0+group: removes the intercept: groupCC groupCL075 groupctrl groupHKCC
+
+# estimate common dispersion and tagwise dispersions in one run (recommended):
+y <- estimateDisp(y, design, robust=T)
+
+# testing for DE genes
+fit <- glmQLFit(y, design, robust = T)
+```
+
+```{r tables_out, echo=TRUE}
+table(out$gene_biotype)
+table(keep)
+```
+
+# Overview of data
+Getting a feeling for the data using PCA, MDS, fold change and dispersion plots
+```{r generalQC}
+
+# Create a matrix from our table of counts
+pca_matrix <- y$counts %>% 
+  # coerce to a matrix
+  as.matrix() %>% 
+  # transpose the matrix so that rows = samples and columns = variables
+  t()
+
+# Perform the PCA
+sample_pca <- prcomp(pca_matrix, scale = T)
+
+# Variance explained by PCs
+pc_eigenvalues <- sample_pca$sdev^2
+
+# create a "tibble" manually with 
+# a variable indicating the PC number
+# and a variable with the variances
+pc_eigenvalues <- tibble(PC = factor(1:length(pc_eigenvalues)), 
+                         variance = pc_eigenvalues) %>% 
+  # add a new column with the percent variance
+  mutate(pct = variance/sum(variance)*100) %>% 
+  # add another column with the cumulative variance explained
+  mutate(pct_cum = cumsum(pct))
+
+# Pareto chart: show both the variance explained by individual PCs as well as the cumulative variance
+scree <- pc_eigenvalues %>% 
+  ggplot(aes(x = PC)) +
+  geom_col(aes(y = pct)) +
+  geom_line(aes(y = pct_cum, group = 1)) + 
+  geom_point(aes(y = pct_cum)) +
+  labs(x = "Principal component", y = "Fraction variance explained",
+       title = "PC - explained variance") 
+
+# Visualising samples on PC space
+# The PC scores are stored in the "x" value of the prcomp object
+pc_scores <- sample_pca$x
+pc_scores <- pc_scores %>% 
+  # convert to a tibble retaining the sample names as a new column
+  as_tibble(rownames = "sample")
+
+# print the result
+pca_plot <- pc_scores %>% 
+  mutate(samplegroup = sapply(sample, 
+                              function(x) strsplit(x, split = "_")[[1]][2])) %>% 
+  # create the plot
+  ggplot(aes(x = PC1, y = PC2, colour = factor(samplegroup))) +
+  geom_point() +
+  #scale_color_manual(values = viridis::viridis(4)) +
+  scale_color_brewer(palette="Set2") +
+  theme_classic() +
+  #coord_fixed()+
+  labs(colour = "Group", title = "PC scores")
+
+# which genes have the most influence on each PC axis
+pc_loadings <- sample_pca$rotation%>% 
+  as_tibble(rownames = "ENSEMBL")
+
+# What are the top 10 genes with highest loading on PC1 and PC2?
+top_genes <- pc_loadings %>% 
+  # select only the PCs we are interested in
+  dplyr::select(ENSEMBL, PC1, PC2) %>%
+  # convert to a "long" format
+  pivot_longer(matches("PC"), names_to = "PC", values_to = "loading") %>% 
+  # for each PC
+  group_by(PC) %>% 
+  # arrange by descending order of loading
+  arrange(desc(abs(loading))) %>% 
+  # take the 10 top rows
+  slice_head(n = 20) %>% 
+  # # pull the gene column as a vector
+  # pull(gene) %>% 
+  # ensure only unique genes are retained
+  distinct(ENSEMBL, .keep_all = T)
+
+top_genes
+
+# #  use this list of gene names to subset the eigenvalues table
+# top_loadings <- pc_loadings %>%
+#   filter(ENSEMBL %in% top_genes$ENSEMBL) %>%
+#   left_join(., annot[,c("ENSEMBL", "SYMBOL")]) %>%
+#   distinct(ENSEMBL, .keep_all = T)
+# 
+# # Visualise variable loadings
+# ggplot(data = top_loadings) +
+#   geom_segment(aes(x = 0, y = 0, xend = PC1, yend = PC2),
+#                arrow = arrow(length = unit(0.1, "in")),
+#                colour = "brown") +
+#   geom_text(aes(x = PC1, y = PC2, label = SYMBOL),
+#             size = 2) +
+#   scale_x_continuous(expand = c(0.02, 0.02))
+
+(scree | pca_plot) + plot_annotation(tag_levels = "A")
+
+# # factoextra
+# # Graph of individuals. Individuals with a similar profile are grouped together
+# fviz_pca_ind(sample_pca,
+#              col.ind = "cos2", # Color by the quality of representation
+#              gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+#              repel = TRUE     # Avoid text overlapping
+#              )
+# 
+# # Graph of variables. Positive correlated variables point to the same side of the plot. Negative correlated variables point to opposite sides of the graph.
+# var <- get_pca_var(sample_pca)
+# var
+# # Coordinates
+# head(var$coord)
+# # Cos2: quality on the factore map
+# head(var$cos2)
+# # Contributions to the principal components
+# head(var$contrib)
+# # Coordinates of variables
+# head(var$coord, 4)
+# 
+# #highlight the most contributing variables for each dimension:
+# corrplot(var$contrib, is.corr=FALSE)    
+# 
+# fviz_pca_var(sample_pca,
+#              col.var = "contrib", # Color by contributions to the PC
+#              gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+#              repel = TRUE     # Avoid text overlapping
+#              )
+# 
+# fviz_pca_biplot(sample_pca, repel = TRUE,
+#                 col.var = "#2E9FDF", # Variables color
+#                 col.ind = "#696969"  # Individuals color
+#                 )
+
+
+# MDS
+pch <- c(0,1,2,15)
+colors <- rep(c("darkgreen", "red", "blue", "black"), 1)
+plotMDS(y, col=colors[factor(group)], pch=pch[factor(group)], main = "MDS")
+legend("topright", legend=levels(factor(group)), pch=pch, col=colors, ncol=2)
+
+mds <- plotMDS(y)
+a <- data.frame(X = mds[["x"]], Y = mds[["y"]]) %>% 
+  mutate(SampleID = colnames(mds[["distance.matrix.squared"]])) %>% 
+  mutate(Condition = str_sub(SampleID, start = 4))
+ggplot(a, aes(x = X, y = Y, colour = Condition)) +
+  geom_point(size = 3) + 
+  scale_colour_manual(values = c("#440154FF", "#365C8DFF", "#1FA187FF", "#9FDA3AFF")) +
+  theme_bw()
+ggsave("MDS.pdf", height = 3, width = 5)
+
+dist.cmd <- cmdscale(mds[["distance.matrix.squared"]]) 
+# MD plots
+# An MD plot visualizes the library size-adjusted log-fold change between two libraries (the difference) against the average log-expression across those libraries (the mean). The following command produces an MD plot that compares sample 1 to an artificial reference library constructed from the average of all the other samples
+for(i in 1:length(group))
+{
+  plotMD(y, column=i)
+  abline(h=0, col="red", lty=2, lwd=2)
+}
+
+# BCV
+plotBCV(y)
+
+# QLdispersions
+plotQLDisp(fit)
+
+```
+
+# Heatmap with all genes
+```{r general_clustering}
+logCPM <- cpm(y, prior.count=2, log=TRUE)
+rownames(logCPM) <- y$genes$Symbol
+colnames(logCPM) <- paste(y$samples$group, c(rep(1, 4), rep(2, 4), rep(3, 4), rep(4, 4)), sep="-")
+
+z <- t(scale(t(logCPM))) 
+
+write.csv2(z, "scaled_expression_all_samples.csv", row.names = T, quote = F)
+
+# complex heatmap
+Heatmap(z, name = "z-score", 
+        col = viridis_pal(option = "A")(8),
+      #  col =colorRampPalette(rev(brewer.pal(n = 5, name ="Spectral")))(50),
+        #width = ncol(z)*unit(10, "mm"),
+        #height = nrow(z)*unit(2, "mm"),
+        cluster_rows= T, cluster_columns = T, 
+        show_column_dend = T, show_row_dend = F, 
+        show_row_names = F,
+        column_names_side = "top", column_names_rot = 45, 
+        column_names_gp = gpar(fontsize = 10))
+        #column_title = NULL, 
+        #row_title = NULL,
+        #border = TRUE, border_gp = gpar(col = "darkgrey"))
+
+```
+
+
+# Contrast-wise DE calculations
+```{r DE}
+# comparisons:
+# groupCC(1) groupCL075(2) groupctrl(3) groupHKCC(4)
+
+# to compare CC-ctrl:
+CC_ctrl_con <- makeContrasts(groupCC - groupctrl, levels = design)
+tr.CCvsctrl <- glmTreat(fit, contrast=CC_ctrl_con)
+is.de.CCvsctrl <- decideTestsDGE(tr.CCvsctrl)
+
+
+# to compare HKCC-ctrl:
+HKCC_ctrl_con <- makeContrasts(groupHKCC - groupctrl, levels = design)
+tr.HKCCvsctrl <- glmTreat(fit, contrast=HKCC_ctrl_con)
+is.de.HKCCvsctrl <- decideTestsDGE(tr.HKCCvsctrl)
+
+
+# to compare CL075-ctrl:
+CL075_ctrl_con <- makeContrasts(groupCL075 - groupctrl, levels = design)
+tr.CL075vsctrl <- glmTreat(fit, contrast=CL075_ctrl_con)
+is.de.CL075vsctrl <- decideTestsDGE(tr.CL075vsctrl)
+
+
+# to compare CL075-CC:
+CL075_CC_con <- makeContrasts(groupCL075 - groupCC, levels = design)
+tr.CL075vsCC <- glmTreat(fit, contrast=CL075_CC_con)
+is.de.CL075vsCC <- decideTestsDGE(tr.CL075vsCC)
+
+
+# to compare HKCC-CC:
+HKCC_CC_con <- makeContrasts(groupCC - groupHKCC, levels = design)
+tr.HKCCvsCC <- glmTreat(fit, contrast=HKCC_CC_con)
+is.de.HKCCvsCC <- decideTestsDGE(tr.HKCCvsCC)
+
+savetable <- function(tr.obj)
+{
+  genes <- tr.obj$genes %>% 
+    rownames_to_column("ENSEMBL")
+  
+  ensembl = useEnsembl(biomart="ensembl", dataset="mmusculus_gene_ensembl")
+  genedesc <- getBM(attributes=c('external_gene_name','description'), 
+                    filters = 'external_gene_name', 
+                    values = genes$Symbol, mart =ensembl) %>% 
+    rename(Symbol = external_gene_name)
+  
+  tr <- tr.obj$table %>% 
+    rownames_to_column("ENSEMBL") %>% 
+    left_join(., genes) %>%
+    left_join(., genedesc) %>% 
+    relocate(Symbol, .before = logFC) %>% 
+    relocate(description, .before = logFC) %>% 
+    mutate(adjusted.pvalue.BH = p.adjust(PValue, method = "BH")) %>% 
+    arrange(adjusted.pvalue.BH) %>% 
+    select(-unshrunk.logFC) %>% 
+    filter(abs(logFC) >= 2) %>% 
+    filter(adjusted.pvalue.BH <= 0.05)
+  
+  return(tr)
+}
+
+write.csv2(savetable(tr.HKCCvsCC), "CC_vs_HKCC_DEG_list.csv", row.names = F, quote = F, dec = ".")
+write.csv2(savetable(tr.CL075vsctrl), "CL075_vs_ctrl_DEG_list.csv", row.names = F, quote = F, dec = ".")
+
+```
+
+## Top 100 DE in CL075 vs ctrl / HKCC vs CC - heatmaps
+```{r heat}
+CL075vsctrlo <- savetable(tr.CL075vsctrl) %>% 
+  dplyr::arrange(PValue)
+
+CL075vsctrllogCPM <- logCPM %>% 
+  as.data.frame() %>% 
+  tibble::rownames_to_column("Symbol") %>% 
+  left_join(CL075vsctrlo, .) %>% 
+  distinct(Symbol, .keep_all = T) %>% 
+  dplyr::select(-description) %>% 
+  na.omit()
+
+rownames(CL075vsctrllogCPM) <- CL075vsctrllogCPM$Symbol
+  
+CL075vsctrllogCPM <- CL075vsctrllogCPM %>% 
+  dplyr::select(-c(ENSEMBL, logFC, logCPM, PValue, adjusted.pvalue.BH)) %>% 
+  dplyr::select(c(starts_with("CL075"), starts_with("ctrl")))
+
+CL075vsctrllogCPM <- t(scale(t(CL075vsctrllogCPM)))
+write.csv2(CL075vsctrllogCPM, "CL075_vs_ctrl_scaled_expression.csv", row.names = T, quote = F)
+
+Heatmap(CL075vsctrllogCPM, name = "z-score", 
+        col =colorRampPalette(rev(brewer.pal(n = 5, name ="BrBG")))(50), 
+        cluster_rows= T, cluster_columns = T, 
+        show_column_dend = F, show_row_dend = F, 
+        show_row_names = T, row_names_gp = gpar(fontsize = 3),
+        column_names_side = "top", column_names_rot = 45, 
+        column_names_gp = gpar(fontsize = 10),
+        column_km = 4,  row_km = 4, row_title = NULL,
+        border = TRUE, border_gp = gpar(col = "darkgrey"), 
+        column_title = "Top 100 CL075 vs ctrl")
+
+HKCCvsCCo <- savetable(tr.HKCCvsCC) %>% 
+  dplyr::arrange(PValue)
+
+HKCCvsCClogCPM <- logCPM %>% 
+  as.data.frame() %>% 
+  tibble::rownames_to_column("Symbol") %>% 
+  left_join(HKCCvsCCo, .) %>% 
+  tibble::column_to_rownames("Symbol") %>% 
+  dplyr::select(-c(ENSEMBL, description, logFC, logCPM, PValue, adjusted.pvalue.BH)) %>% 
+  dplyr::select(c(starts_with("HKCC"), starts_with("CC")))
+
+HKCCvsCClogCPM <- t(scale(t(HKCCvsCClogCPM)))
+write.csv2(HKCCvsCClogCPM, "LiveCC_vs_deadCC_scaled_expression.csv", row.names = T, quote = F)
+
+Heatmap(HKCCvsCClogCPM, name = "z-score", 
+        col =colorRampPalette(rev(brewer.pal(n = 5, name ="BrBG")))(50), 
+        cluster_rows= T, cluster_columns = T, 
+        show_column_dend = F, show_row_dend = F, 
+        show_row_names = T, row_names_gp = gpar(fontsize = 3),
+        column_names_side = "top", column_names_rot = 45, 
+        column_names_gp = gpar(fontsize = 10),
+        column_km = 4,  row_km = 4, row_title = NULL,
+        border = TRUE, border_gp = gpar(col = "darkgrey"), 
+        column_title = "Top 100 HKCC vs CC")
+
+```
+
+## Heatmaps and volcano plots per comparison
+
+```{r computations}
+
+# volcano function
+my_volcano <- function(dgelrt, title)
+{
+  log10FDRthr = 1.3
+  log2FCthr = 2
+  
+  x <-dgelrt$table
+  annot <- biomaRt::select(org.Hs.eg.db,
+    keys = row.names(x),
+    columns = c('ENTREZID','SYMBOL','ENSEMBL', 'GENENAME'),
+    keytype = 'ENSEMBL')
+
+  df <- x %>% 
+    mutate(FDR = p.adjust(PValue, method = "BH")) %>% 
+    tibble::rownames_to_column("ENSEMBL") %>% 
+    left_join(., annot) %>% 
+    mutate(geneID = case_when(
+      is.na(SYMBOL) ~ ENSEMBL,
+      TRUE ~ SYMBOL))
+    
+
+  df %>% 
+    mutate(logPval = -log10(PValue)) %>% 
+    mutate(logFDR = -log10(FDR)) %>% 
+    mutate(col = case_when(
+      logFDR >= log10FDRthr & abs(logFC) >= log2FCthr ~ "deepskyblue4",
+      logFDR < log10FDRthr & abs(logFC) >= log2FCthr ~ "firebrick",
+      logFDR >= log10FDRthr & abs(logFC) < log2FCthr ~ "darkolivegreen",
+      TRUE ~ "gray"
+    )) %>% 
+    mutate(label = case_when(
+      logFDR >= log10FDRthr & abs(logFC) >= 4 ~ geneID,
+      TRUE ~ ""
+    )) %>% 
+    distinct(ENSEMBL, .keep_all = T) -> df
+  
+  ggplot(df, aes(x = logFC, y = logFDR, colour = col, label = label)) +
+    geom_point(alpha = 0.4) +
+    scale_colour_identity() +
+    scale_shape_identity() +
+    theme_bw() +
+    scale_x_continuous("log2 fold change", breaks = seq(-10,10,2)) +
+    geom_hline(yintercept = log10FDRthr, linetype = "dashed", colour = "gray84") +
+    geom_vline(xintercept = log2FCthr, linetype = "dashed", colour = "gray84") +
+    geom_vline(xintercept = -log2FCthr, linetype = "dashed", colour = "gray84") +
+    #geom_text(hjust=0, vjust=0, size = 2) +
+    geom_text_repel(size = 2.2) +
+    xlab("log2 Fold Change") +
+    ylab("-log10 adjusted p-value") +
+    ggtitle(title)
+}
+
+
+cl075_cc_o <- order(tr.CL075vsCC$table$PValue)
+cl075_cc_logCPM <- logCPM[cl075_cc_o[1:50],c(grep(pattern = "CL075|^CC", 
+                                                   colnames(logCPM)))]
+cl075_cc_logCPM <- t(scale(t(cl075_cc_logCPM)))
+
+HKCC_cc_o <- order(tr.HKCCvsCC$table$PValue)
+HKCC_cc_logCPM <- logCPM[HKCC_cc_o[1:50],c(grep(pattern = "HKCC|^CC", 
+                                                 colnames(logCPM)))]
+HKCC_cc_logCPM <- t(scale(t(HKCC_cc_logCPM)))
+
+HKCC_ctrl_o <- order(tr.HKCCvsctrl$table$PValue)
+HKCC_ctrl_logCPM <- logCPM[HKCC_ctrl_o[1:50],c(grep(pattern = "HKCC|ctrl", 
+                                                     colnames(logCPM)))]
+HKCC_ctrl_logCPM <- t(scale(t(HKCC_ctrl_logCPM)))
+
+CC_ctrl_o <- order(tr.CCvsctrl$table$PValue)
+CC_ctrl_logCPM <- logCPM[CC_ctrl_o[1:50],c(grep(pattern = "^CC|ctrl", 
+                                                 colnames(logCPM)))]
+CC_ctrl_logCPM <- t(scale(t(CC_ctrl_logCPM)))
+
+CL075_ctrl_o <- order(tr.CL075vsctrl$table$PValue)
+CL075_ctrl_logCPM <- logCPM[CL075_ctrl_o[1:50],c(grep(pattern = "CL075|ctrl", 
+                                                       colnames(logCPM)))]
+CL075_ctrl_logCPM <- t(scale(t(CL075_ctrl_logCPM)))
+
+```
+
+### CL075 vs CC
+```{r CL075_CC}
+
+summary(is.de.CL075vsCC)
+plotMD(tr.CL075vsCC, 
+       status=is.de.CL075vsCC, 
+       legend="topright")
+
+#pdf("cl075_cc_heatmap100.pdf")
+cl075_cc_heatmap <- Heatmap(cl075_cc_logCPM, name = "z-score", 
+        width = ncol(cl075_cc_logCPM)*unit(10, "mm"), 
+        col =colorRampPalette(rev(brewer.pal(n = 5, name ="Spectral")))(50), 
+        cluster_rows= T, cluster_columns = T, 
+        show_column_dend = F, show_row_dend = T, 
+        show_row_names = T, row_names_gp = gpar(fontsize = 5),
+        column_names_side = "top", column_names_rot = 45, 
+        column_names_gp = gpar(fontsize = 10),
+        row_km = 2, column_km = 3, border = TRUE, 
+        column_title = NULL, row_title = NULL, 
+        border_gp = gpar(col = "darkgrey"))
+#dev.off()
+draw(cl075_cc_heatmap)
+
+my_volcano(tr.CL075vsCC, "CC vs CL075")
+#ggsave(my_volcano(tr.CL075vsCC, "CC vs CL075"), file = "CC vs CL075.pdf")
+
+
+```
+
+### HKCC vs CC
+```{r HKCC_cc_heatmap100}
+summary(is.de.HKCCvsCC)
+plotMD(tr.HKCCvsCC, 
+       status=is.de.HKCCvsCC, 
+       legend="topright")
+
+#pdf("HKCC_CC_heatmap100.pdf")
+HKCC_cc_heatmap <- Heatmap(HKCC_cc_logCPM, name = "z-score", 
+        width = ncol(HKCC_cc_logCPM)*unit(10, "mm"), 
+        col =colorRampPalette(rev(brewer.pal(n = 5, name ="Spectral")))(50), 
+        cluster_rows= T, cluster_columns = T, 
+        show_column_dend = F, show_row_dend = T, 
+        show_row_names = T, row_names_gp = gpar(fontsize = 5),
+        column_names_side = "top", column_names_rot = 45, 
+        column_names_gp = gpar(fontsize = 10),
+        row_km = 2, column_km = 3, border = TRUE, 
+        column_title = NULL, row_title = NULL, 
+        border_gp = gpar(col = "darkgrey"))
+#dev.off()
+draw(HKCC_cc_heatmap)
+
+my_volcano(tr.HKCCvsCC, "CC vs HKCC")
+ggsave(my_volcano(tr.HKCCvsCC, "Heat-killed ΔLPS E.coli vs Live ΔLPS E.coli"), 
+       file = "volcano CC vs HKCC.pdf",
+       width = 6, height = 4)
+```
+
+### HKCC vs ctrl
+```{r HKCC_ctrl_heatmap100}
+summary(is.de.HKCCvsctrl)
+plotMD(tr.HKCCvsctrl, 
+       status=is.de.HKCCvsctrl, 
+       legend="topright")
+
+#pdf("HKCC_ctrl_heatmap100.pdf")
+HKCC_ctrl_heatmap <- Heatmap(HKCC_ctrl_logCPM, name = "z-score", 
+        width = ncol(HKCC_ctrl_logCPM)*unit(10, "mm"), 
+        col =colorRampPalette(rev(brewer.pal(n = 5, name ="Spectral")))(50), 
+        cluster_rows= T, cluster_columns = T, 
+        show_column_dend = F, show_row_dend = T, 
+        show_row_names = T, row_names_gp = gpar(fontsize = 5),
+        column_names_side = "top", column_names_rot = 45, 
+        column_names_gp = gpar(fontsize = 10),
+        row_km = 2, column_km = 3, border = TRUE, 
+        column_title = NULL, row_title = NULL, 
+        border_gp = gpar(col = "darkgrey"))
+#dev.off()
+draw(HKCC_ctrl_heatmap)
+
+my_volcano(tr.HKCCvsctrl, "ctrl vs HKCC")
+#ggsave(my_volcano(tr.HKCCvsctrl, "ctrl vs HKCC"), file = "ctrl vs HKCC.pdf")
+```
+
+### CC vs ctrl
+```{r CC_ctrl_heatmap100}
+summary(is.de.CCvsctrl)
+plotMD(tr.CCvsctrl, 
+       status=is.de.CCvsctrl, 
+       legend="topright")
+
+#pdf("CC_ctrl_heatmap100.pdf")
+CC_ctrl_heatmap <- Heatmap(CC_ctrl_logCPM, name = "z-score", 
+        width = ncol(CC_ctrl_logCPM)*unit(10, "mm"), 
+        col =colorRampPalette(rev(brewer.pal(n = 5, name ="Spectral")))(50), 
+        cluster_rows= T, cluster_columns = T, 
+        show_column_dend = F, show_row_dend = T, 
+        show_row_names = T, row_names_gp = gpar(fontsize = 5),
+        column_names_side = "top", column_names_rot = 45, 
+        column_names_gp = gpar(fontsize = 10),
+        row_km = 2, column_km = 3, border = TRUE, 
+        column_title = NULL, row_title = NULL, 
+        border_gp = gpar(col = "darkgrey"))
+#dev.off()
+draw(CC_ctrl_heatmap)
+
+my_volcano(tr.CCvsctrl, "ctrl vs CC")
+#ggsave(my_volcano(tr.CCvsctrl, "ctrl vs CC"), file = "ctrl vs CC.pdf")
+
+```
+
+### CL075 vs ctrl
+```{r CL075_ctrl_heatmap100}
+summary(is.de.CL075vsctrl)
+plotMD(tr.CL075vsctrl, 
+       status=is.de.CL075vsctrl, 
+       legend="topright")
+
+#pdf("CL075_ctrl_heatmap100.pdf")
+CL075_ctrl_heatmap <- Heatmap(CL075_ctrl_logCPM, name = "z-score", 
+        width = ncol(CL075_ctrl_logCPM)*unit(10, "mm"), 
+        col =colorRampPalette(rev(brewer.pal(n = 5, name ="Spectral")))(50), 
+        cluster_rows= T, cluster_columns = T, 
+        show_column_dend = F, show_row_dend = T, 
+        show_row_names = T, row_names_gp = gpar(fontsize = 5),
+        column_names_side = "top", column_names_rot = 45, 
+        column_names_gp = gpar(fontsize = 10),
+        row_km = 2, column_km = 3, border = TRUE, 
+        column_title = NULL, row_title = NULL, 
+        border_gp = gpar(col = "darkgrey"))
+#dev.off()
+draw(CL075_ctrl_heatmap)
+
+my_volcano(tr.CL075vsctrl, "ctrl vs CL075")
+#ggsave(my_volcano(tr.CL075vsctrl, "ctrl vs CL075"), file = "ctrl vs CL075.pdf")
+
+```
+
+# Common genes between CL075 vs ctrl and HKCC vs CC
+```{r overlap}
+genes <- tr.CL075vsctrl$genes %>% 
+  rownames_to_column("ENSEMBL")
+
+Cl075_sorted <- tr.CL075vsctrl$table %>% 
+  arrange(PValue) %>% 
+  rownames_to_column("ENSEMBL") %>% 
+  slice_head(n = 200) %>% 
+  select(ENSEMBL, logFC, logCPM, PValue) %>% 
+  rename(logFC_CL075 = logFC, logCPM_CL075 = logCPM, PValue_CL075 = PValue)
+
+HKCC_sorted <- tr.HKCCvsCC$table %>% 
+  arrange(PValue) %>% 
+  rownames_to_column("ENSEMBL") %>% 
+  slice_head(n = 200) %>% 
+  select(ENSEMBL, logFC, logCPM, PValue) %>% 
+  rename(logFC_HKCC = logFC, logCPM_HKCC = logCPM, PValue_HKCC = PValue)
+
+overlap <- inner_join(Cl075_sorted, HKCC_sorted, by = "ENSEMBL") %>% 
+  left_join(genes) %>% 
+  column_to_rownames("Symbol") %>% 
+  select(-ENSEMBL)
+
+overlap
+```
+
+```{r save_objects}
+save.image(file = "BulkRNA_CountAnalysis.RData")
+```
